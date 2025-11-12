@@ -84,9 +84,13 @@ pub fn init_memory_management() {
     debug!("kernel address space init OK: {:#x?}", kernel_aspace);
     KERNEL_ASPACE.init_once(SpinNoIrq::new(kernel_aspace));
     unsafe { axhal::asm::write_kernel_page_table(kernel_page_table_root()) };
+    // flush all TLB
+    axhal::asm::flush_tlb(None);
 }
 
 /// Initializes kernel paging for secondary CPUs.
 pub fn init_memory_management_secondary() {
     unsafe { axhal::asm::write_kernel_page_table(kernel_page_table_root()) };
+    // flush all TLB
+    axhal::asm::flush_tlb(None);
 }
