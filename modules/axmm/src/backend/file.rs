@@ -162,6 +162,8 @@ impl BackendOps for FileBackend {
                             pages += 1;
                             AxResult::Ok(())
                         })?;
+                    } else if page_flags.contains(access_flags) {
+                        pages += 1;
                     }
                 }
                 // If the page is not mapped, try map it.
