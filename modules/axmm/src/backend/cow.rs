@@ -157,6 +157,8 @@ impl BackendOps for CowBackend {
                     {
                         self.handle_cow_fault(addr, paddr, flags, pt)?;
                         pages += 1;
+                    } else if page_flags.contains(access_flags) {
+                        pages += 1;
                     }
                 }
                 // If the page is not mapped, try map it.

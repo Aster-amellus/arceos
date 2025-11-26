@@ -71,7 +71,11 @@ pub trait BackendOps {
         Ok(())
     }
 
-    /// Populate a memory region. Returns number of pages populated.
+    /// Populate a memory region and return how many pages now satisfy
+    /// `access_flags`.
+    ///
+    /// If another thread has already mapped the page with sufficient permissions,
+    /// treat it as populated.
     fn populate(
         &self,
         _range: VirtAddrRange,
