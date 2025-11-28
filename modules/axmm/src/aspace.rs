@@ -104,8 +104,9 @@ impl AddrSpace {
         hint: VirtAddr,
         size: usize,
         limit: VirtAddrRange,
+        align: usize,
     ) -> Option<VirtAddr> {
-        self.areas.find_free_area(hint, size, limit, PAGE_SIZE_4K)
+        self.areas.find_free_area(hint, size, limit, align)
     }
 
     pub fn find_area(&self, vaddr: VirtAddr) -> Option<&MemoryArea<Backend>> {
