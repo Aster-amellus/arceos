@@ -1,15 +1,19 @@
-use core::fmt;
+use alloc::sync::Arc;
+use core::{fmt, ops::DerefMut};
 
-use axerrno::{AxError, AxResult, ax_err};
-use axhal::mem::phys_to_virt;
-use axhal::paging::{MappingFlags, PageTable};
-use axhal::trap::PageFaultFlags;
+use axerrno::{AxError, AxResult, ax_bail};
+use axhal::{
+    mem::phys_to_virt,
+    paging::{MappingFlags, PageTable},
+    trap::PageFaultFlags,
+};
+use axsync::Mutex;
 use memory_addr::{
     MemoryAddr, PAGE_SIZE_4K, PageIter4K, PhysAddr, VirtAddr, VirtAddrRange, is_aligned_4k,
 };
 use memory_set::{MemoryArea, MemorySet};
 
-use crate::backend::Backend;
+use crate::backend::{Backend, BackendOps};
 
 /// The virtual memory address space.
 pub struct AddrSpace {
@@ -39,6 +43,11 @@ impl AddrSpace {
         &self.pt
     }
 
+    /// Returns a mutable reference to the inner page table.
+    pub const fn page_table_mut(&mut self) -> &mut PageTable {
+        &mut self.pt
+    }
+
     /// Returns the root physical address of the inner page table.
     pub const fn page_table_root(&self) -> PhysAddr {
         self.pt.root_paddr()
@@ -46,12 +55,11 @@ impl AddrSpace {
 
     /// Checks if the address space contains the given address range.
     pub fn contains_range(&self, start: VirtAddr, size: usize) -> bool {
-        self.va_range
-            .contains_range(VirtAddrRange::from_start_size(start, size))
+        self.va_range.contains(start) && (self.va_range.end - start) >= size
     }
 
     /// Creates a new empty address space.
-    pub(crate) fn new_empty(base: VirtAddr, size: usize) -> AxResult<Self> {
+    pub fn new_empty(base: VirtAddr, size: usize) -> AxResult<Self> {
         Ok(Self {
             va_range: VirtAddrRange::from_start_size(base, size),
             areas: MemorySet::new(),
@@ -68,18 +76,29 @@ impl AddrSpace {
     /// Returns an error if the two address spaces overlap.
     #[cfg(feature = "copy")]
     pub fn copy_mappings_from(&mut self, other: &AddrSpace) -> AxResult {
-        if self.va_range.overlaps(other.va_range) {
-            return ax_err!(InvalidInput, "address space overlap");
+        self.pt
+            .modify()
+            .copy_from(&other.pt, other.base(), other.size());
+        Ok(())
+    }
+
+    fn validate_region(&self, start: VirtAddr, size: usize) -> AxResult {
+        if !self.contains_range(start, size) {
+            ax_bail!(NoMemory, "address out of range");
         }
-        self.pt.copy_from(&other.pt, other.base(), other.size());
+        if !start.is_aligned_4k() || !is_aligned_4k(size) {
+            ax_bail!(InvalidInput, "address is not aligned");
+        }
         Ok(())
     }
 
     /// Finds a free area that can accommodate the given size.
     ///
-    /// The search starts from the given hint address, and the area should be within the given limit range.
+    /// The search starts from the given hint address, and the area should be
+    /// within the given limit range.
     ///
-    /// Returns the start address of the free area. Returns None if no such area is found.
+    /// Returns the start address of the free area. Returns None if no such area
+    /// is found.
     pub fn find_free_area(
         &self,
         hint: VirtAddr,
@@ -87,6 +106,10 @@ impl AddrSpace {
         limit: VirtAddrRange,
     ) -> Option<VirtAddr> {
         self.areas.find_free_area(hint, size, limit, PAGE_SIZE_4K)
+    }
+
+    pub fn find_area(&self, vaddr: VirtAddr) -> Option<&MemoryArea<Backend>> {
+        self.areas.find(vaddr)
     }
 
     /// Add a new linear mapping.
@@ -104,43 +127,64 @@ impl AddrSpace {
         size: usize,
         flags: MappingFlags,
     ) -> AxResult {
-        if !self.contains_range(start_vaddr, size) {
-            return ax_err!(InvalidInput, "address out of range");
-        }
-        if !start_vaddr.is_aligned_4k() || !start_paddr.is_aligned_4k() || !is_aligned_4k(size) {
-            return ax_err!(InvalidInput, "address not aligned");
+        self.validate_region(start_vaddr, size)?;
+
+        if !start_paddr.is_aligned_4k() {
+            ax_bail!(InvalidInput, "address is not aligned");
         }
 
-        let offset = start_vaddr.as_usize() - start_paddr.as_usize();
+        let offset = start_vaddr.as_usize() as isize - start_paddr.as_usize() as isize;
         let area = MemoryArea::new(start_vaddr, size, flags, Backend::new_linear(offset));
         self.areas.map(area, &mut self.pt, false)?;
         Ok(())
     }
 
-    /// Add a new allocation mapping.
-    ///
-    /// See [`Backend`] for more details about the mapping backends.
-    ///
-    /// The `flags` parameter indicates the mapping permissions and attributes.
-    ///
-    /// Returns an error if the address range is out of the address space or not
-    /// aligned.
-    pub fn map_alloc(
+    pub fn map(
         &mut self,
         start: VirtAddr,
         size: usize,
         flags: MappingFlags,
         populate: bool,
+        backend: Backend,
     ) -> AxResult {
-        if !self.contains_range(start, size) {
-            return ax_err!(InvalidInput, "address out of range");
+        self.validate_region(start, size)?;
+
+        let area = MemoryArea::new(start, size, flags, backend);
+        self.areas.map(area, &mut self.pt, false)?;
+        if populate {
+            self.populate_area(start, size, flags)?;
         }
-        if !start.is_aligned_4k() || !is_aligned_4k(size) {
-            return ax_err!(InvalidInput, "address not aligned");
+        Ok(())
+    }
+
+    /// Populates the area with physical frames, returning false if the area
+    /// contains unmapped area.
+    pub fn populate_area(
+        &mut self,
+        mut start: VirtAddr,
+        size: usize,
+        access_flags: MappingFlags,
+    ) -> AxResult {
+        self.validate_region(start, size)?;
+        let end = start + size;
+
+        let mut modify = self.pt.modify();
+        while let Some(area) = self.areas.find(start) {
+            let range = VirtAddrRange::new(start, area.end().min(end));
+            area.backend()
+                .populate(range, area.flags(), access_flags, &mut modify)?;
+            start = area.end();
+            assert!(start.is_aligned_4k());
+            if start >= end {
+                break;
+            }
         }
 
-        let area = MemoryArea::new(start, size, flags, Backend::new_alloc(populate));
-        self.areas.map(area, &mut self.pt, false)?;
+        if start < end {
+            // If the area is not fully mapped, we return ENOMEM.
+            ax_bail!(NoMemory);
+        }
+
         Ok(())
     }
 
@@ -149,12 +193,7 @@ impl AddrSpace {
     /// Returns an error if the address range is out of the address space or not
     /// aligned.
     pub fn unmap(&mut self, start: VirtAddr, size: usize) -> AxResult {
-        if !self.contains_range(start, size) {
-            return ax_err!(InvalidInput, "address out of range");
-        }
-        if !start.is_aligned_4k() || !is_aligned_4k(size) {
-            return ax_err!(InvalidInput, "address not aligned");
-        }
+        self.validate_region(start, size)?;
 
         self.areas.unmap(start, size, &mut self.pt)?;
         Ok(())
@@ -168,7 +207,7 @@ impl AddrSpace {
         F: FnMut(VirtAddr, usize, usize),
     {
         if !self.contains_range(start, size) {
-            return ax_err!(InvalidInput, "address out of range");
+            ax_bail!(InvalidInput, "address out of range");
         }
         let mut cnt = 0;
         // If start is aligned to 4K, start_align_down will be equal to start_align_up.
@@ -176,7 +215,7 @@ impl AddrSpace {
         for vaddr in PageIter4K::new(start.align_down_4k(), end_align_up)
             .expect("Failed to create page iterator")
         {
-            let (mut paddr, _, _) = self.pt.query(vaddr).map_err(|_| AxError::BadAddress)?;
+            let (mut paddr, ..) = self.pt.query(vaddr).map_err(|_| AxError::BadAddress)?;
 
             let mut copy_size = (size - cnt).min(PAGE_SIZE_4K);
 
@@ -223,18 +262,11 @@ impl AddrSpace {
     /// Returns an error if the address range is out of the address space or not
     /// aligned.
     pub fn protect(&mut self, start: VirtAddr, size: usize, flags: MappingFlags) -> AxResult {
-        if !self.contains_range(start, size) {
-            return ax_err!(InvalidInput, "address out of range");
-        }
-        if !start.is_aligned_4k() || !is_aligned_4k(size) {
-            return ax_err!(InvalidInput, "address not aligned");
-        }
+        self.validate_region(start, size)?;
 
-        // TODO
-        self.pt
-            .protect_region(start, size, flags, true)
-            .map_err(|_| AxError::BadState)?
-            .ignore();
+        self.areas
+            .protect(start, size, |_| Some(flags), &mut self.pt)?;
+
         Ok(())
     }
 
@@ -253,7 +285,9 @@ impl AddrSpace {
         size: usize,
         access_flags: MappingFlags,
     ) -> bool {
-        let mut range = VirtAddrRange::from_start_size(start, size);
+        let Some(mut range) = VirtAddrRange::try_from_start_size(start, size) else {
+            return false;
+        };
         for area in self.areas.iter() {
             if area.end() <= range.start {
                 continue;
@@ -287,14 +321,65 @@ impl AddrSpace {
             return false;
         }
         if let Some(area) = self.areas.find(vaddr) {
-            let orig_flags = area.flags();
-            if orig_flags.contains(access_flags) {
-                return area
-                    .backend()
-                    .handle_page_fault(vaddr, orig_flags, &mut self.pt);
+            let flags = area.flags();
+            if flags.contains(access_flags) {
+                let page_size = area.backend().page_size();
+                let populate_result = area.backend().populate(
+                    VirtAddrRange::from_start_size(vaddr.align_down(page_size), page_size as _),
+                    flags,
+                    access_flags,
+                    &mut self.pt.modify(),
+                );
+                return match populate_result {
+                    Ok((n, callback)) => {
+                        if let Some(cb) = callback {
+                            cb(self);
+                        }
+                        if n == 0 {
+                            warn!("No pages populated for {vaddr:?} ({flags:?})");
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    Err(err) => {
+                        warn!("Failed to populate pages for {vaddr:?} ({flags:?}): {err}");
+                        false
+                    }
+                };
             }
         }
         false
+    }
+
+    /// Attempts to clone the current address space into a new one.
+    ///
+    /// This method creates a new empty address space with the same base and
+    /// size, then iterates over all memory areas in the original address
+    /// space to copy or share their mappings into the new one.
+    pub fn try_clone(&mut self) -> AxResult<Arc<Mutex<Self>>> {
+        let new_aspace = Arc::new(Mutex::new(Self::new_empty(self.base(), self.size())?));
+        let new_aspace_clone = new_aspace.clone();
+
+        let mut guard = new_aspace.lock();
+
+        let mut self_modify = self.pt.modify();
+        for area in self.areas.iter() {
+            let new_backend = area.backend().clone_map(
+                area.va_range(),
+                area.flags(),
+                &mut self_modify,
+                &mut guard.pt.modify(),
+                &new_aspace_clone,
+            )?;
+
+            let new_area = MemoryArea::new(area.start(), area.size(), area.flags(), new_backend);
+            let aspace = guard.deref_mut();
+            aspace.areas.map(new_area, &mut aspace.pt, false)?;
+        }
+        drop(guard);
+
+        Ok(new_aspace)
     }
 }
 

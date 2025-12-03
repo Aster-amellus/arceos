@@ -1,46 +1,30 @@
-//! [ArceOS](https://github.com/arceos-org/arceos) filesystem module.
-//!
-//! It provides unified filesystem operations for various filesystems.
-//!
-//! # Cargo Features
-//!
-//! - `fatfs`: Use [FAT] as the main filesystem and mount it on `/`. This feature
-//!   is **enabled** by default.
-//! - `devfs`: Mount [`axfs_devfs::DeviceFileSystem`] on `/dev`. This feature is
-//!   **enabled** by default.
-//! - `ramfs`: Mount [`axfs_ramfs::RamFileSystem`] on `/tmp`. This feature is
-//!   **enabled** by default.
-//! - `myfs`: Allow users to define their custom filesystems to override the
-//!   default. In this case, [`MyFileSystemIf`] is required to be implemented
-//!   to create and initialize other filesystems. This feature is **disabled** by
-//!   by default, but it will override other filesystem selection features if
-//!   both are enabled.
-//!
-//! [FAT]: https://en.wikipedia.org/wiki/File_Allocation_Table
-//! [`MyFileSystemIf`]: fops::MyFileSystemIf
+#![no_std]
+#![allow(clippy::new_ret_no_self)]
+#![feature(maybe_uninit_slice)]
 
-#![cfg_attr(all(not(test), not(doc)), no_std)]
-#![feature(doc_auto_cfg)]
+extern crate alloc;
 
 #[macro_use]
 extern crate log;
-extern crate alloc;
 
-mod dev;
+use axdriver::{AxBlockDevice, AxDeviceContainer, prelude::*};
+
+#[cfg(feature = "fat")]
+mod disk;
 mod fs;
-mod mounts;
-mod root;
 
-pub mod api;
-pub mod fops;
+mod highlevel;
+pub use highlevel::*;
 
-use axdriver::{AxDeviceContainer, prelude::*};
+pub fn init_filesystems(mut block_devs: AxDeviceContainer<AxBlockDevice>) {
+    info!("Initialize filesystem subsystem...");
 
-/// Initializes filesystems by block devices.
-pub fn init_filesystems(mut blk_devs: AxDeviceContainer<AxBlockDevice>) {
-    info!("Initialize filesystems...");
-
-    let dev = blk_devs.take_one().expect("No block device found!");
+    let dev = block_devs.take_one().expect("No block device found!");
     info!("  use block device 0: {:?}", dev.device_name());
-    self::root::init_rootfs(self::dev::Disk::new(dev));
+
+    let fs = fs::new_default(dev).expect("Failed to initialize filesystem");
+    info!("  filesystem type: {:?}", fs.name());
+
+    let mp = axfs_ng_vfs::Mountpoint::new_root(&fs);
+    ROOT_FS_CONTEXT.call_once(|| FsContext::new(mp.root_location()));
 }

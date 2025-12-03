@@ -61,9 +61,9 @@ fs = [
     "dep:axfs",
     "axruntime/fs",
 ] # TODO: try to remove "paging"
-myfs = ["axfs?/myfs"]
-ext4fs = ["axfs?/ext4fs"]
-fatfs = ["axfs?/fatfs"]
+fs-ext4 = ["fs", "axfs/ext4"]
+fs-fat = ["fs", "axfs/fat"]
+fs-times = ["fs", "axfs/times"]
 
 # Networking
 net = ["alloc", "paging", "axdriver/virtio-net", "dep:axnet", "axruntime/net"]
