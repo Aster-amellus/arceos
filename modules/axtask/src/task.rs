@@ -1,4 +1,6 @@
 use alloc::{boxed::Box, string::String, sync::Arc};
+#[cfg(feature = "preempt")]
+use core::sync::atomic::AtomicUsize;
 use core::{
     alloc::Layout,
     cell::{Cell, UnsafeCell},
@@ -10,17 +12,13 @@ use core::{
     sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering},
     task::{Context, Poll},
 };
-use futures_util::task::AtomicWaker;
-
-#[cfg(feature = "preempt")]
-use core::sync::atomic::AtomicUsize;
-
-use kspin::SpinNoIrq;
-use memory_addr::{VirtAddr, align_up_4k};
 
 use axhal::context::TaskContext;
 #[cfg(feature = "tls")]
 use axhal::tls::TlsArea;
+use futures_util::task::AtomicWaker;
+use kspin::SpinNoIrq;
+use memory_addr::{VirtAddr, align_up_4k};
 
 use crate::{AxCpuMask, AxTask, AxTaskRef, future::block_on};
 
@@ -35,12 +33,12 @@ pub enum TaskState {
     /// Task is running on some CPU.
     Running = 1,
     /// Task is ready to run on some scheduler's ready queue.
-    Ready = 2,
+    Ready   = 2,
     /// Task is blocked (in the wait queue or timer list),
     /// and it has finished its scheduling process, it can be wake up by `notify()` on any run queue safely.
     Blocked = 3,
     /// Task is exited and waiting for being dropped.
-    Exited = 4,
+    Exited  = 4,
 }
 
 /// User-defined task extended data.
@@ -244,6 +242,12 @@ impl TaskInner {
             self.interrupt_waker.register(cx.waker());
             Poll::Pending
         }
+    }
+
+    /// Clears the interrupt state of the task.
+    #[inline]
+    pub fn clear_interrupt(&self) {
+        self.interrupted.store(false, Ordering::Release);
     }
 
     /// Interrupts the task.
