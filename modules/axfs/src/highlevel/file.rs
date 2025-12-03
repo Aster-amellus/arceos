@@ -740,6 +740,49 @@ impl FileBackend {
             Self::Direct(loc) => loc.entry().as_file()?.set_len(len),
         }
     }
+
+    /// Check whether a given page number is already present in the page cache.
+    pub fn is_page_cached(&self, pn: u32) -> bool {
+        match self {
+            Self::Cached(cached) => cached.shared.page_cache.lock().contains(&pn),
+            Self::Direct(_) => false,
+        }
+    }
+
+    /// Prefetch a range of pages into the page cache synchronously.
+    /// Returns the number of pages actually fetched.
+    pub fn prefetch_pages(&self, start_page: u32, num_pages: u32) -> usize {
+        match self {
+            Self::Cached(cached) => {
+                let file = match cached.inner.entry().as_file() {
+                    Ok(f) => f,
+                    Err(_) => return 0,
+                };
+                let mut guard = cached.shared.page_cache.lock();
+                let mut fetched = 0usize;
+                let end = start_page.saturating_add(num_pages);
+                for pn in start_page..end {
+                    if guard.contains(&pn) {
+                        continue;
+                    }
+                    // allocate page and read it
+                    let mut page = match PageCache::new() {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    };
+                    if cached.in_memory {
+                        page.data().fill(0);
+                    } else if let Err(_) = file.read_at(page.data(), pn as u64 * PAGE_SIZE as u64) {
+                        break;
+                    }
+                    guard.put(pn, page);
+                    fetched += 1;
+                }
+                fetched
+            }
+            Self::Direct(_) => 0,
+        }
+    }
 }
 
 /// Provides `std::fs::File`-like interface.
@@ -871,6 +914,15 @@ impl File {
     pub fn flush(&self) -> axio::Result {
         self.access(FileFlags::empty())?;
         Ok(())
+    }
+
+    /// Get the current file position (offset).
+    /// Returns 0 for stream files.
+    pub fn position(&self) -> u64 {
+        self.position
+            .as_ref()
+            .map(|p| *p.lock())
+            .unwrap_or(0)
     }
 }
 
