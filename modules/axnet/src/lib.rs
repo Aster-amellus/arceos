@@ -32,6 +32,8 @@ pub(crate) mod state;
 pub mod tcp;
 pub mod udp;
 pub mod unix;
+#[cfg(feature = "vsock")]
+pub mod vsock;
 mod wrapper;
 
 use alloc::{borrow::ToOwned, boxed::Box};
@@ -113,13 +115,16 @@ pub fn init_network(mut net_devs: AxDeviceContainer<AxNetDevice>) {
     LISTEN_TABLE.init_once(ListenTable::new());
 }
 
-/// Initializes vsock devices.
+/// Init vsock subsystem by vsock devices.
 #[cfg(feature = "vsock")]
 pub fn init_vsock(mut vsock_devs: AxDeviceContainer<AxVsockDevice>) {
+    use crate::device::register_vsock_device;
     info!("Initialize vsock subsystem...");
     if let Some(dev) = vsock_devs.take_one() {
         info!("  use vsock 0: {:?}", dev.device_name());
-        warn!("  vsock not implemented yet!");
+        if let Err(e) = register_vsock_device(dev) {
+            warn!("Failed to initialize vsock device: {:?}", e);
+        }
     } else {
         warn!("  No vsock device found!");
     }
