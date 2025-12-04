@@ -758,11 +758,10 @@ impl FileBackend {
                     Ok(f) => f,
                     Err(_) => return 0,
                 };
-                let mut guard = cached.shared.page_cache.lock();
                 let mut fetched = 0usize;
                 let end = start_page.saturating_add(num_pages);
                 for pn in start_page..end {
-                    if guard.contains(&pn) {
+                    if cached.shared.page_cache.lock().contains(&pn) {
                         continue;
                     }
                     // allocate page and read it
@@ -775,8 +774,135 @@ impl FileBackend {
                     } else if let Err(_) = file.read_at(page.data(), pn as u64 * PAGE_SIZE as u64) {
                         break;
                     }
-                    guard.put(pn, page);
-                    fetched += 1;
+                    let mut guard = cached.shared.page_cache.lock();
+                    if !guard.contains(&pn) {
+                        guard.put(pn, page);
+                        fetched += 1;
+                    }
+                }
+                fetched
+            }
+            Self::Direct(_) => 0,
+        }
+    }
+
+    /// Prefetch a range of pages into the page cache asynchronously (non-blocking).
+    /// Returns the number of pages actually fetched.
+    pub fn try_prefetch_pages(&self, start_page: u32, num_pages: u32) -> usize {
+        match self {
+            Self::Cached(cached) => {
+                let file = match cached.inner.entry().as_file() {
+                    Ok(f) => f,
+                    Err(_) => return 0,
+                };
+                
+                let mut fetched = 0usize;
+                let end = start_page.saturating_add(num_pages);
+
+                // Fast path for in-memory files (no I/O)
+                if cached.in_memory {
+                    for pn in start_page..end {
+                        if let Some(guard) = cached.shared.page_cache.try_lock() {
+                            if guard.contains(&pn) { continue; }
+                        } else {
+                            return fetched;
+                        }
+                        
+                        let mut page = match PageCache::new() {
+                            Ok(p) => p,
+                            Err(_) => break,
+                        };
+                        page.data().fill(0);
+                        
+                        if let Some(mut guard) = cached.shared.page_cache.try_lock() {
+                            if !guard.contains(&pn) {
+                                guard.put(pn, page);
+                                fetched += 1;
+                            }
+                        } else {
+                            return fetched;
+                        }
+                    }
+                    return fetched;
+                }
+
+                // Batched read for disk files
+                let mut current_page = start_page;
+                const BATCH_SIZE: u32 = 256; // 1MB
+
+                // Reuse buffer to reduce allocation overhead
+                let mut buffer = Vec::with_capacity((BATCH_SIZE as usize) * PAGE_SIZE);
+
+                while current_page < end {
+                    let mut range_len = 0;
+                    
+                    // 1. Find contiguous range of missing pages
+                    if let Some(guard) = cached.shared.page_cache.try_lock() {
+                        while current_page + range_len < end {
+                            if guard.contains(&(current_page + range_len)) {
+                                if range_len > 0 { break; }
+                                current_page += 1;
+                            } else {
+                                range_len += 1;
+                                if range_len >= BATCH_SIZE { break; }
+                            }
+                        }
+                    } else {
+                        return fetched;
+                    }
+
+                    if range_len == 0 { continue; }
+
+                    // 2. Read the range
+                    let byte_size = (range_len as usize) * PAGE_SIZE;
+                    let offset = (current_page as u64) * (PAGE_SIZE as u64);
+                    
+                    unsafe { buffer.set_len(byte_size) };
+                    
+                    match file.read_at(&mut buffer, offset) {
+                        Ok(n) => {
+                            let pages_read = (n + PAGE_SIZE - 1) / PAGE_SIZE;
+                            let mut prepared_pages = Vec::with_capacity(pages_read);
+
+                            // 3. Prepare pages (CPU intensive, no lock)
+                            for i in 0..pages_read {
+                                let pn = current_page + i as u32;
+                                let page_offset = i * PAGE_SIZE;
+                                let chunk_size = (n - page_offset).min(PAGE_SIZE);
+                                
+                                let mut page = match PageCache::new() {
+                                    Ok(p) => p,
+                                    Err(_) => break,
+                                };
+                                
+                                page.data()[..chunk_size].copy_from_slice(&buffer[page_offset..page_offset+chunk_size]);
+                                if chunk_size < PAGE_SIZE {
+                                    page.data()[chunk_size..].fill(0);
+                                }
+                                prepared_pages.push((pn, page));
+                            }
+
+                            // 4. Batch insert (Single lock acquisition)
+                            if let Some(mut guard) = cached.shared.page_cache.try_lock() {
+                                for (pn, page) in prepared_pages {
+                                    if !guard.contains(&pn) {
+                                        guard.put(pn, page);
+                                        fetched += 1;
+                                    }
+                                }
+                            } else {
+                                // Failed to acquire lock, drop prepared pages
+                                return fetched;
+                            }
+
+                            if n < byte_size {
+                                // EOF reached, stop prefetching
+                                return fetched;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                    current_page += range_len;
                 }
                 fetched
             }
