@@ -18,7 +18,9 @@ use intrusive_collections::{LinkedList, LinkedListAtomicLink, intrusive_adapter}
 use lru::LruCache;
 use spin::{Mutex, RwLock};
 
+mod readahead;
 use super::FsContext;
+use crate::highlevel::file::readahead::RA_MAX_PAGES;
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy)]
@@ -305,6 +307,7 @@ const PAGE_SIZE: usize = 4096;
 pub struct PageCache {
     addr: VirtAddr,
     dirty: bool,
+    pg_readahead: bool,
 }
 
 impl PageCache {
@@ -317,6 +320,7 @@ impl PageCache {
         Ok(Self {
             addr: addr.into(),
             dirty: false,
+            pg_readahead: false,
         })
     }
 
@@ -377,6 +381,7 @@ pub struct CachedFile {
     /// Only one thread can append to the file at a time, while multiple writers
     /// are permitted.
     append_lock: RwLock<()>,
+    ra_state: Mutex<readahead::ReadaheadState>,
 }
 
 impl Clone for CachedFile {
@@ -386,6 +391,7 @@ impl Clone for CachedFile {
             shared: self.shared.clone(),
             in_memory: self.in_memory,
             append_lock: RwLock::new(()),
+            ra_state: Mutex::new(readahead::ReadaheadState::new(RA_MAX_PAGES)),
         }
     }
 }
@@ -430,6 +436,7 @@ impl CachedFile {
             shared,
             in_memory,
             append_lock: RwLock::new(()),
+            ra_state: Mutex::new(readahead::ReadaheadState::new(RA_MAX_PAGES)),
         }
     }
 
@@ -471,6 +478,88 @@ impl CachedFile {
             page.dirty = false;
         }
         Ok(())
+    }
+
+    pub fn try_prefetch(
+        &self,
+        range: Range<u64>,
+        mut write_buffer_callback: impl FnMut(usize, &mut PageCache, Range<usize>) -> VfsResult<usize>,
+    ) -> VfsResult<usize> {
+        let file = self.inner.entry().as_file()?;
+        let mut read_len = 0usize;
+        let start_page = (range.start / PAGE_SIZE as u64) as u32;
+        let end_page = range.end.div_ceil(PAGE_SIZE as u64) as u32;
+        let req_size = end_page - start_page;
+        let page_offset = (range.start % PAGE_SIZE as u64) as usize;
+
+        for pn in start_page..end_page {
+            let page_start = pn as u64 * PAGE_SIZE as u64;
+
+            use readahead::Readahead;
+            let mut async_pg_pn = None;
+            let mut should_sync_readahead = false;
+            {
+                let mut guard = self.shared.page_cache.lock();
+                if let Some((page, async_pn_flag)) = self.find_page_from_cache(&mut guard, pn) {
+                    // write to dst immediately
+                    read_len = write_buffer_callback(
+                        read_len,
+                        page,
+                        page_offset..(range.end - page_start).min(PAGE_SIZE as u64) as usize,
+                    )?;
+                    async_pg_pn = async_pn_flag;
+                } else {
+                    should_sync_readahead = true;
+                }
+            }
+            // trigger async readahead
+            if async_pg_pn.is_some() {
+                let async_pn = async_pg_pn.unwrap();
+                let guard = self.ra_state.lock();
+                let start_pn = guard.start_pn;
+                let size = guard.size;
+                drop(guard);
+                let shared = self.shared.clone();
+                let file = file.inner().clone();
+                let in_memory = self.in_memory;
+                axtask::spawn(move || {
+                    readahead::async_prefetch(shared, file, in_memory, start_pn, size, async_pn);
+                });
+                continue;
+            }
+
+            // trigger sync readahead
+            if should_sync_readahead {
+                // compute readahead range and update ra_state
+                // sync read from io and write to cache, then write to dst
+                let (start_pn, size, async_pg_pn) = {
+                    let mut guard = self.ra_state.lock();
+                    guard.update_window_on_cache_miss(pn, req_size);
+                    (guard.start_pn, guard.size, guard.get_trigger_offset())
+                };
+
+                readahead::io_submit(
+                    &self.shared,
+                    file,
+                    self.in_memory,
+                    start_pn,
+                    size,
+                    async_pg_pn,
+                )?;
+                let mut guard = self.shared.page_cache.lock();
+                let page = guard
+                    .get_mut(&pn)
+                    .expect("cache miss after sync prefetch, should not happen");
+                read_len = write_buffer_callback(
+                    read_len,
+                    page,
+                    page_offset..(range.end - page_start).min(PAGE_SIZE as u64) as usize,
+                )?;
+                continue;
+            }
+        }
+        self.ra_state.lock().update_history(end_page - 1);
+        Ok(read_len)
     }
 
     fn page_or_insert<'a>(
@@ -552,15 +641,20 @@ impl CachedFile {
         if end <= offset {
             return Ok(0);
         }
-        self.with_pages(
-            offset..end,
-            |_| Ok(0),
-            |read, page, range| {
-                let len = range.end - range.start;
-                dst.write(&page.data()[range.start..range.end])?;
-                Ok(read + len)
-            },
-        )
+        self.try_prefetch(offset..end, |read, page, range| {
+            let len = range.end - range.start;
+            dst.write(&page.data()[range.start..range.end])?;
+            Ok(read + len)
+        })
+        // self.with_pages(
+        //     offset..end,
+        //     |_| Ok(0),
+        //     |read, page, range| {
+        //         let len = range.end - range.start;
+        //         dst.write(&page.data()[range.start..range.end])?;
+        //         Ok(read + len)
+        //     },
+        // )
     }
 
     fn write_at_locked(&self, buf: &mut impl Buf, offset: u64) -> VfsResult<usize> {
