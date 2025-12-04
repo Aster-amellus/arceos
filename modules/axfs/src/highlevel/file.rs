@@ -18,6 +18,7 @@ use intrusive_collections::{LinkedList, LinkedListAtomicLink, intrusive_adapter}
 use lru::LruCache;
 use spin::{Mutex, RwLock};
 
+mod readahead;
 use super::FsContext;
 
 bitflags::bitflags! {
@@ -305,6 +306,7 @@ const PAGE_SIZE: usize = 4096;
 pub struct PageCache {
     addr: VirtAddr,
     dirty: bool,
+    pg_readahead: bool,
 }
 
 impl PageCache {
@@ -317,6 +319,7 @@ impl PageCache {
         Ok(Self {
             addr: addr.into(),
             dirty: false,
+            pg_readahead: false,
         })
     }
 
@@ -377,6 +380,7 @@ pub struct CachedFile {
     /// Only one thread can append to the file at a time, while multiple writers
     /// are permitted.
     append_lock: RwLock<()>,
+    ra_state: Mutex<readahead::ReadaheadState>,
 }
 
 impl Clone for CachedFile {
@@ -386,6 +390,7 @@ impl Clone for CachedFile {
             shared: self.shared.clone(),
             in_memory: self.in_memory,
             append_lock: RwLock::new(()),
+            ra_state: Mutex::new(readahead::ReadaheadState::new()),
         }
     }
 }
@@ -430,6 +435,7 @@ impl CachedFile {
             shared,
             in_memory,
             append_lock: RwLock::new(()),
+            ra_state: Mutex::new(readahead::ReadaheadState::new()),
         }
     }
 
@@ -471,6 +477,40 @@ impl CachedFile {
             page.dirty = false;
         }
         Ok(())
+    }
+
+    pub fn try_prefetch(
+        &self,
+        range: Range<u64>,
+        mut write_buffer_callback: impl FnMut(usize, &mut PageCache, Range<usize>) -> VfsResult<usize>,
+    ) -> VfsResult<usize> {
+        let file = self.inner.entry().as_file()?;
+        let mut read_len = 0usize;
+        let start_page = (range.start / PAGE_SIZE as u64) as u32;
+        let end_page = range.end.div_ceil(PAGE_SIZE as u64) as u32;
+        let page_offset = (range.start % PAGE_SIZE as u64) as usize;
+
+        for pn in start_page..end_page {
+            let page_start = pn as u64 * PAGE_SIZE as u64;
+            let page_caches = &mut self.shared.page_cache.lock();
+            let ra_state = &mut self.ra_state.lock();
+            let page = readahead::prefetch_page(
+                file,
+                ra_state,
+                self.in_memory,
+                page_caches,
+                start_page,
+                end_page - start_page,
+                pn,
+            )?;
+            read_len = write_buffer_callback(
+                read_len,
+                page,
+                page_offset..(range.end - page_start).min(PAGE_SIZE as u64) as usize,
+            )?;
+        }
+        self.ra_state.lock().update_history(end_page - 1);
+        Ok(read_len)
     }
 
     fn page_or_insert<'a>(
@@ -552,15 +592,11 @@ impl CachedFile {
         if end <= offset {
             return Ok(0);
         }
-        self.with_pages(
-            offset..end,
-            |_| Ok(0),
-            |read, page, range| {
-                let len = range.end - range.start;
-                dst.write(&page.data()[range.start..range.end])?;
-                Ok(read + len)
-            },
-        )
+        self.try_prefetch(offset..end, |read, page, range| {
+            let len = range.end - range.start;
+            dst.write(&page.data()[range.start..range.end])?;
+            Ok(read + len)
+        })
     }
 
     fn write_at_locked(&self, buf: &mut impl Buf, offset: u64) -> VfsResult<usize> {
