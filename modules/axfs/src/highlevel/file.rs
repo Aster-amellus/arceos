@@ -488,23 +488,54 @@ impl CachedFile {
         let mut read_len = 0usize;
         let start_page = (range.start / PAGE_SIZE as u64) as u32;
         let end_page = range.end.div_ceil(PAGE_SIZE as u64) as u32;
+        let req_size = end_page - start_page;
         let page_offset = (range.start % PAGE_SIZE as u64) as usize;
 
         for pn in start_page..end_page {
             let page_start = pn as u64 * PAGE_SIZE as u64;
 
             use readahead::Readahead;
+            let mut should_async_readahead = false;
+            let mut should_sync_readahead = false;
+            {
+                let mut guard = self.shared.page_cache.lock();
+                if let Some((page, should_async_prefetch)) =
+                    self.find_page_from_cache(&mut guard, pn)
+                {
+                    read_len = write_buffer_callback(
+                        read_len,
+                        page,
+                        page_offset..(range.end - page_start).min(PAGE_SIZE as u64) as usize,
+                    )?;
+                    should_async_readahead = should_async_prefetch;
+                } else {
+                    should_sync_readahead = true;
+                }
+            }
+            // trigger async readahead
+            if should_async_readahead {
+                let guard = self.ra_state.lock();
+                let start_pn = guard.start_pn;
+                let size = guard.size;
+                drop(guard);
+                let shared = self.shared.clone();
+                let file = file.inner().clone();
+                axtask::spawn(move || {
+                    readahead::async_prefetch(shared, file, start_pn, size);
+                });
+                continue;
+            }
 
-            self.prefetch_page(file, start_page, end_page - start_page, pn)?;
+            // trigger sync readahead
+            if should_sync_readahead {
+                // TODO: implement sync readahead
+                // compute readahead range and update ra_state
+                // sync read from io and write to cache, then write to dst
+                continue;
+            }
 
-            let mut guard = self.shared.page_cache.lock();
-            let page = guard.get_mut(&pn).unwrap();
-
-            read_len = write_buffer_callback(
-                read_len,
-                page,
-                page_offset..(range.end - page_start).min(PAGE_SIZE as u64) as usize,
-            )?;
+            // cache hit
+            continue;
         }
         self.ra_state.lock().update_history(end_page - 1);
         Ok(read_len)
