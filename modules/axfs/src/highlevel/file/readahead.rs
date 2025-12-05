@@ -1,8 +1,10 @@
-use axfs_ng_vfs::{FileNode, VfsResult};
+use alloc::sync::Arc;
+
+use axfs_ng_vfs::{FileNode, FileNodeOps, VfsResult};
 use lru::LruCache;
 
 use super::PAGE_SIZE;
-use crate::PageCache;
+use crate::{CachedFile, PageCache, highlevel::file::CachedFileShared};
 
 const READAHEAD_MAX_SIZE: u32 = 32; // max_readahead pages (e.g., 128KB / 4KB)
 const INIT_SCALE: u32 = 2; // scale_0 (2 or 4) 
@@ -65,105 +67,65 @@ impl ReadaheadState {
     }
 }
 
-/// - start: the start pn from user read request,
-/// - pn the currrent pn to read to dst
-/// - read_size: the size of user read request
-pub fn prefetch_page<'a>(
-    file: &FileNode,
-    ra_state: &'a mut ReadaheadState,
-    in_memory: bool,
-    caches: &'a mut LruCache<u32, PageCache>,
-    start: u32,
-    read_size: u32,
-    pn: u32,
-) -> VfsResult<&'a mut PageCache> {
-    let mut need_prefetch = false;
-    // 1. Check cache hit and readahead flag
-    if let Some(cache) = caches.get_mut(&pn) {
-        if cache.pg_readahead {
-            cache.pg_readahead = false;
-            ra_state.subsequent_readahead();
-            need_prefetch = true;
-        }
-    } else {
-        // 2. Cache miss: Analyze pattern and setup initial window
-        use AccessPattern::*;
-        match AccessPattern::check(ra_state, start, read_size) {
-            Sequential | Beginning | Unaligned => {
-                // Linux treats unaligned sequential reads (overlapping previous read)
-                // as sequential. On a miss, we restart the window.
-                ra_state.initial_readahead(pn, read_size);
-            }
-            LargeRead | Random => {
-                // For random or very large reads, disable readahead to avoid cache pollution
-                ra_state.size = 0;
-            }
-        }
-        need_prefetch = true;
-    }
-
-    // 3. Perform prefetch if needed (borrow of caches is released above)
-    if need_prefetch {
-        do_sync_prefetch(caches, in_memory, file, ra_state)?;
-    }
-
-    // 4. Ensure the requested page is loaded (if prefetch didn't load it)
-    if !caches.contains(&pn) {
-        if caches.len() == caches.cap().get() {
-            if let Some((evict_pn, mut page)) = caches.pop_lru() {
-                if page.dirty {
-                    file.write_at(page.data(), evict_pn as u64 * PAGE_SIZE as u64)?;
-                }
-            }
-        }
-        let mut page = PageCache::new()?;
-        if in_memory {
-            page.data().fill(0);
-        } else {
-            file.read_at(page.data(), pn as u64 * PAGE_SIZE as u64)?;
-        }
-        caches.put(pn, page);
-    }
-
-    Ok(caches.get_mut(&pn).unwrap())
-}
-
 fn do_sync_prefetch(
-    caches: &mut LruCache<u32, PageCache>,
+    shared: &CachedFileShared,
     in_memory: bool,
-    file: &FileNode,
-    ra_state: &ReadaheadState,
+    file: Arc<dyn FileNodeOps>,
+    ra_state: ReadaheadState,
 ) -> VfsResult<()> {
+    // If size is 0, we do nothing here. The caller (prefetch_page) must handle the demand read.
     if ra_state.size == 0 {
         return Ok(());
     }
     let pg_readahead_trigger = ra_state.get_trigger_offset();
+
     for pn in ra_state.start_pn..(ra_state.start_pn + ra_state.size) {
-        // Use get() to update LRU position if page exists
-        if caches.get(&pn).is_some() {
-            continue;
-        }
-        
-        if caches.len() == caches.cap().get() {
-            if let Some((pn, mut page)) = caches.pop_lru() {
-                if page.dirty {
-                    file.write_at(page.data(), pn as u64 * PAGE_SIZE as u64)?;
-                }
+        // 1. Check if page exists (Optimistic check)
+        {
+            let caches = shared.page_cache.lock();
+            if caches.contains(&pn) {
+                continue;
             }
-        }
+        } // Lock released here
+
+        // 2. Prepare page and perform I/O without holding the lock
+        // Note: We might do redundant work if another thread loads it meanwhile,
+        // but it's better than blocking the whole cache during I/O.
         let mut page = PageCache::new()?;
+
+        // Set the flag on the trigger page
+        if pn == pg_readahead_trigger {
+            page.pg_readahead = true;
+        }
+
         if in_memory {
             page.data().fill(0);
         } else {
             file.read_at(page.data(), pn as u64 * PAGE_SIZE as u64)?;
         }
-        caches.put(pn, page);
+
+        // 3. Insert into cache
+        let mut caches = shared.page_cache.lock();
+        // Check again to avoid overwriting if someone else loaded it
+        if !caches.contains(&pn) {
+            if caches.len() == caches.cap().get() {
+                if let Some((evict_pn, mut evicted_page)) = caches.pop_lru() {
+                    if evicted_page.dirty {
+                        // We must drop the lock before writing back to avoid deadlock/blocking
+                        drop(caches);
+                        file.write_at(evicted_page.data(), evict_pn as u64 * PAGE_SIZE as u64)?;
+                        // Re-acquire lock to continue
+                        caches = shared.page_cache.lock();
+                    }
+                }
+            }
+            // Re-check capacity after potential re-acquire
+            if caches.len() < caches.cap().get() {
+                caches.put(pn, page);
+            }
+        }
     }
-    
-    // Set the flag on the trigger page
-    if let Some(cache) = caches.get_mut(&pg_readahead_trigger) {
-        cache.pg_readahead = true;
-    }
+
     Ok(())
 }
 
@@ -190,5 +152,106 @@ impl AccessPattern {
         } else {
             Random
         }
+    }
+}
+
+pub(super) trait Readahead {
+    fn prefetch_page<'a>(
+        &'a self,
+        file: &FileNode,
+        start: u32,
+        read_size: u32,
+        pn: u32,
+    ) -> VfsResult<()>;
+}
+
+impl Readahead for CachedFile {
+    fn prefetch_page<'a>(
+        &'a self,
+        file: &FileNode,
+        start: u32,
+        read_size: u32,
+        pn: u32,
+    ) -> VfsResult<()> {
+        let mut need_prefetch = false;
+        let mut need_async = false;
+
+        // 1. Check cache hit and readahead flag
+        if let Some(cache) = self.shared.page_cache.lock().get_mut(&pn) {
+            if cache.pg_readahead {
+                cache.pg_readahead = false;
+                self.ra_state.lock().subsequent_readahead();
+                need_prefetch = true;
+                need_async = true;
+            }
+        } else {
+            // 2. Cache miss: Analyze pattern and setup initial window
+            use AccessPattern::*;
+            let mut ra_state = self.ra_state.lock(); // Fixed: removed &mut
+            match AccessPattern::check(&ra_state, start, read_size) {
+                Sequential | Beginning | Unaligned => {
+                    // Linux treats unaligned sequential reads (overlapping previous read)
+                    // as sequential. On a miss, we restart the window.
+                    ra_state.initial_readahead(pn, read_size);
+                }
+                LargeRead | Random => {
+                    // For random or very large reads, disable readahead to avoid cache pollution
+                    ra_state.size = 0;
+                }
+            }
+            need_prefetch = true;
+        }
+
+        // 3. Perform prefetch if needed (borrow of caches is released above)
+        if need_prefetch {
+            let ra_state = *self.ra_state.lock();
+            let in_memory = self.in_memory;
+            let file_ops = file.inner().clone(); // Get Arc<dyn FileNodeOps>
+
+            if need_async {
+                let shared = self.shared.clone();
+                axtask::spawn(move || {
+                    // We ignore the result of async prefetch
+                    let _ = do_sync_prefetch(&shared, in_memory, file_ops, ra_state);
+                });
+            } else {
+                do_sync_prefetch(&self.shared, in_memory, file_ops, ra_state)?;
+            }
+        }
+
+        // 4. Ensure the requested page is loaded (Critical for Random/LargeRead or if prefetch failed)
+        // If readahead was disabled (size=0), do_sync_prefetch did nothing.
+        // We must load the current page 'pn' synchronously.
+        let mut caches = self.shared.page_cache.lock();
+        if !caches.contains(&pn) {
+            // Drop lock to perform I/O
+            drop(caches);
+
+            let mut page = PageCache::new()?;
+            if self.in_memory {
+                page.data().fill(0);
+            } else {
+                file.read_at(page.data(), pn as u64 * PAGE_SIZE as u64)?;
+            }
+
+            // Re-acquire lock to insert
+            let mut caches = self.shared.page_cache.lock();
+            if !caches.contains(&pn) {
+                if caches.len() == caches.cap().get() {
+                    if let Some((evict_pn, mut evicted_page)) = caches.pop_lru() {
+                        if evicted_page.dirty {
+                            drop(caches);
+                            file.write_at(evicted_page.data(), evict_pn as u64 * PAGE_SIZE as u64)?;
+                            caches = self.shared.page_cache.lock();
+                        }
+                    }
+                }
+                if caches.len() < caches.cap().get() {
+                    caches.put(pn, page);
+                }
+            }
+        }
+
+        Ok(())
     }
 }

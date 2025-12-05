@@ -492,17 +492,14 @@ impl CachedFile {
 
         for pn in start_page..end_page {
             let page_start = pn as u64 * PAGE_SIZE as u64;
-            let page_caches = &mut self.shared.page_cache.lock();
-            let ra_state = &mut self.ra_state.lock();
-            let page = readahead::prefetch_page(
-                file,
-                ra_state,
-                self.in_memory,
-                page_caches,
-                start_page,
-                end_page - start_page,
-                pn,
-            )?;
+
+            use readahead::Readahead;
+
+            self.prefetch_page(file, start_page, end_page - start_page, pn)?;
+
+            let mut guard = self.shared.page_cache.lock();
+            let page = guard.get_mut(&pn).unwrap();
+
             read_len = write_buffer_callback(
                 read_len,
                 page,
