@@ -144,6 +144,7 @@ pub fn async_prefetch(
     );
 }
 
+/// TODO: here we keep the lock for too long, but just to keep the same with [CachedFile::page_or_insert]
 pub fn sync_prefetch(
     cache_shared: &CachedFileShared,
     file: &FileNode,
@@ -153,14 +154,10 @@ pub fn sync_prefetch(
     async_pg_pn: u32,
 ) -> VfsResult<()> {
     for pn in start_pn..(start_pn + size) {
-        {
-            let caches = cache_shared.page_cache.lock();
-            if caches.contains(&pn) {
-                continue;
-            }
-        }
-
         let mut caches = cache_shared.page_cache.lock();
+        if caches.contains(&pn) {
+            continue;
+        }
 
         // Evict LRU page if cache is full
         // TODO: evict listners won't be notified
@@ -168,10 +165,8 @@ pub fn sync_prefetch(
             if let Some((evict_pn, mut evicted_page)) = caches.pop_lru() {
                 if evicted_page.dirty {
                     // We must drop the lock before writing back to avoid deadlock/blocking
-                    drop(caches);
+                    // drop(caches);
                     file.write_at(evicted_page.data(), evict_pn as u64 * PAGE_SIZE as u64)?;
-                    // Re-acquire lock to continue
-                    caches = cache_shared.page_cache.lock();
                 }
             }
         }
