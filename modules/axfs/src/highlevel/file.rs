@@ -547,7 +547,9 @@ impl CachedFile {
                     async_pg_pn,
                 )?;
                 let mut guard = self.shared.page_cache.lock();
-                let page = self.page_or_insert(file, &mut guard, pn)?.0;
+                let page = guard
+                    .get_mut(&pn)
+                    .expect("cache miss after sync prefetch, should not happen");
                 read_len = write_buffer_callback(
                     read_len,
                     page,

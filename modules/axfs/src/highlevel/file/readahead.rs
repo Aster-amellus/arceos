@@ -42,6 +42,7 @@ impl ReadaheadState {
     // ---------------------------------------------------------------
     /// update readahead window on cache miss
     pub fn cache_miss_update_window(&mut self, trigger_pn: u32, req_size: u32) {
+        // TODO: didn't check prev_pn, should add logic here
         // 1. 计算基准大小: size = req_size * 2 (or 4)
         let scaled_size = req_size.saturating_mul(INIT_RA_SCALE);
 
@@ -57,7 +58,11 @@ impl ReadaheadState {
         self.size = new_size;
 
         // 5. 开启流水线: 初始阶段 async_size = size
-        self.async_size = new_size;
+        self.async_size = if trigger_pn == 0 {
+            new_size - req_size
+        } else {
+            new_size
+        };
     }
 
     /// 分支 2: 后续预读 (Subsequent Readahead / Ramp Up)
