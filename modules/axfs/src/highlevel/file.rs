@@ -519,10 +519,10 @@ impl CachedFile {
             // trigger async readahead
             if async_pg_pn.is_some() {
                 let async_pn = async_pg_pn.unwrap();
-                let guard = self.ra_state.lock();
-                let start_pn = guard.start_pn;
-                let size = guard.size;
-                drop(guard);
+                let (start_pn, size) = {
+                    let guard = self.ra_state.lock();
+                    (guard.start_pn, guard.size)
+                };
                 let shared = self.shared.clone();
                 let file = file.inner().clone();
                 let in_memory = self.in_memory;
@@ -532,34 +532,31 @@ impl CachedFile {
                 continue;
             }
 
-            // trigger sync readahead
             if should_sync_readahead {
-                // compute readahead range and update ra_state
-                // sync read from io and write to cache, then write to dst
-                let (start_pn, size, async_pg_pn) = {
-                    let mut guard = self.ra_state.lock();
-                    guard.update_window_on_cache_miss(pn, req_size);
-                    (guard.start_pn, guard.size, guard.get_trigger_offset())
+                if let Some((start_pn, size, pg_readahead)) = self
+                    .ra_state
+                    .lock()
+                    .update_window_on_cache_miss(pn, req_size)
+                {
+                    // readahead should be triggered
+                    readahead::io_submit(
+                        &self.shared,
+                        file,
+                        self.in_memory,
+                        start_pn,
+                        size,
+                        pg_readahead,
+                    )?;
                 };
 
-                readahead::io_submit(
-                    &self.shared,
-                    file,
-                    self.in_memory,
-                    start_pn,
-                    size,
-                    async_pg_pn,
-                )?;
                 let mut guard = self.shared.page_cache.lock();
-                let page = guard
-                    .get_mut(&pn)
-                    .expect("cache miss after sync prefetch, should not happen");
+                let page = self.page_or_insert(file, &mut guard, pn)?.0;
+
                 read_len = write_buffer_callback(
                     read_len,
                     page,
                     page_offset..(range.end - page_start).min(PAGE_SIZE as u64) as usize,
                 )?;
-                continue;
             }
         }
         self.ra_state.lock().update_history(end_page - 1);
