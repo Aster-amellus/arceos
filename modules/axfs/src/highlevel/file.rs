@@ -563,6 +563,7 @@ impl CachedFile {
         Ok(read_len)
     }
 
+    // TODO: keep the lock for too long
     fn page_or_insert<'a>(
         &self,
         file: &FileNode,

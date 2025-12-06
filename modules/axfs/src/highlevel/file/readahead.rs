@@ -125,25 +125,23 @@ pub(super) trait Readahead {
     ) -> Option<(&'a mut PageCache, Option<u32>)>;
 }
 
+// TODO: terrible performance when request size is small
 impl Readahead for CachedFile {
     fn find_page_from_cache<'a>(
         &self,
         caches: &'a mut LruCache<u32, PageCache>,
         pn: u32,
     ) -> Option<(&'a mut PageCache, Option<u32>)> {
-        match caches.get_mut(&pn) {
-            Some(cache) => {
-                let mut new_pg_pn = None;
-                if cache.pg_readahead {
-                    cache.pg_readahead = false;
-                    let mut ra = self.ra_state.lock();
-                    ra.update_window_for_async();
-                    new_pg_pn = Some(ra.get_trigger_offset());
-                }
-                Some((cache, new_pg_pn))
+        caches.get_mut(&pn).map(|cache| {
+            let mut new_pg_pn = None;
+            if cache.pg_readahead {
+                cache.pg_readahead = false;
+                let mut ra = self.ra_state.lock();
+                ra.update_window_for_async();
+                new_pg_pn = Some(ra.get_trigger_offset());
             }
-            None => None,
-        }
+            (cache, new_pg_pn)
+        })
     }
 }
 
@@ -165,7 +163,6 @@ pub fn async_prefetch(
     );
 }
 
-/// TODO: here we keep the lock for too long, but just to keep the same with [CachedFile::page_or_insert]
 pub fn io_submit(
     cache_shared: &CachedFileShared,
     file: &FileNode,
@@ -175,15 +172,18 @@ pub fn io_submit(
     async_pg_pn: u32,
 ) -> VfsResult<()> {
     for pn in start_pn..(start_pn + size) {
-        let mut caches = cache_shared.page_cache.lock();
-        if caches.contains(&pn) {
-            continue;
-        }
+        {
+            let mut caches = cache_shared.page_cache.lock();
+            if caches.contains(&pn) {
+                continue;
+            }
 
-        // Evict LRU page if cache is full
-        if caches.len() == caches.cap().get() {
-            if let Some((evict_pn, mut evicted_page)) = caches.pop_lru() {
-                cache_shared.evict_cache(file, evict_pn, &mut evicted_page)?;
+            // Evict LRU page if cache is full
+            if caches.len() == caches.cap().get() {
+                if let Some((evict_pn, mut evicted_page)) = caches.pop_lru() {
+                    drop(caches);
+                    cache_shared.evict_cache(file, evict_pn, &mut evicted_page)?;
+                }
             }
         }
 
@@ -199,6 +199,7 @@ pub fn io_submit(
         } else {
             file.read_at(page.data(), pn as u64 * PAGE_SIZE as u64)?;
         }
+        let mut caches = cache_shared.page_cache.lock();
         caches.put(pn, page);
     }
     Ok(())
