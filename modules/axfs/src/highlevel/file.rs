@@ -534,11 +534,11 @@ impl CachedFile {
                 // sync read from io and write to cache, then write to dst
                 let (start_pn, size, async_pg_pn) = {
                     let mut guard = self.ra_state.lock();
-                    guard.cache_miss_update_window(pn, req_size);
+                    guard.update_window_on_cache_miss(pn, req_size);
                     (guard.start_pn, guard.size, guard.get_trigger_offset())
                 };
 
-                readahead::sync_prefetch(
+                readahead::io_submit(
                     &self.shared,
                     file,
                     self.in_memory,
