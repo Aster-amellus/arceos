@@ -1,4 +1,4 @@
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 
 use axfs_ng_vfs::{FileNode, FileNodeOps, VfsResult};
 use lru::LruCache;
@@ -52,7 +52,11 @@ impl ReadaheadState {
         // sequential access, although didn't hit PG_readahead
         // or initial access,
         // or large read request, that is worth readahead
-        if trigger_pn == self.prev_pn + 1 || trigger_pn == 0 || req_size > self.max_pages {
+        if trigger_pn == self.prev_pn + 1
+            || trigger_pn == self.prev_pn
+            || trigger_pn == 0
+            || req_size > self.max_pages
+        {
             let mut new_size = Self::init_ra_size(req_size, self.max_pages);
             if self.size > 0 {
                 new_size = new_size.saturating_mul(RAMP_UP_SCALE).min(self.max_pages);
@@ -76,7 +80,6 @@ impl ReadaheadState {
     /// 论文来源:
     pub fn update_window_for_async(&mut self) {
         // 1. 推进窗口起点: 新起点 = 旧起点 + 旧大小
-        // 必须在更新 self.size 之前执行这一步
         assert!(self.size > 0, "Readahead window size should never be 0");
         self.start_pn = self.start_pn.saturating_add(self.size);
         // 2. 指数倍增: size = prev_size * 2
@@ -137,8 +140,10 @@ impl Readahead for CachedFile {
             if cache.pg_readahead {
                 cache.pg_readahead = false;
                 let mut ra = self.ra_state.lock();
-                ra.update_window_for_async();
-                new_pg_pn = Some(ra.get_trigger_offset());
+                if ra.size > 0 {
+                    ra.update_window_for_async();
+                    new_pg_pn = Some(ra.get_trigger_offset());
+                }
             }
             (cache, new_pg_pn)
         })
@@ -171,25 +176,22 @@ pub fn io_submit(
     size: u32,
     async_pg_pn: u32,
 ) -> VfsResult<()> {
-    for pn in start_pn..(start_pn + size) {
-        {
-            let mut caches = cache_shared.page_cache.lock();
+    let mut pages_to_read = Vec::with_capacity(size as usize);
+    {
+        let caches = cache_shared.page_cache.lock();
+        for pn in start_pn..(start_pn + size) {
             if caches.contains(&pn) {
                 continue;
             }
-
-            // Evict LRU page if cache is full
-            if caches.len() == caches.cap().get() {
-                if let Some((evict_pn, mut evicted_page)) = caches.pop_lru() {
-                    drop(caches);
-                    cache_shared.evict_cache(file, evict_pn, &mut evicted_page)?;
-                }
-            }
+            pages_to_read.push(pn);
         }
+    }
 
+    // lockless load pages
+    let mut loaded_pages = Vec::with_capacity(pages_to_read.len());
+    for &pn in &pages_to_read {
         let mut page = PageCache::new()?;
 
-        // Set the flag on the trigger page
         if pn == async_pg_pn {
             page.pg_readahead = true;
         }
@@ -199,7 +201,22 @@ pub fn io_submit(
         } else {
             file.read_at(page.data(), pn as u64 * PAGE_SIZE as u64)?;
         }
-        let mut caches = cache_shared.page_cache.lock();
+        loaded_pages.push((pn, page));
+    }
+
+    let mut caches = cache_shared.page_cache.lock();
+    for (pn, page) in loaded_pages {
+        if caches.contains(&pn) {
+            continue;
+        }
+
+        if caches.len() == caches.cap().get() {
+            if let Some((evict_pn, mut evicted_page)) = caches.pop_lru() {
+                drop(caches);
+                let _ = cache_shared.evict_cache(file, evict_pn, &mut evicted_page);
+                caches = cache_shared.page_cache.lock();
+            }
+        }
         caches.put(pn, page);
     }
     Ok(())
