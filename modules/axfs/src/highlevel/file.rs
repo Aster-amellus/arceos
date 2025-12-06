@@ -372,6 +372,19 @@ impl CachedFileShared {
             evict_listeners: Mutex::new(LinkedList::default()),
         }
     }
+
+    pub fn evict_cache(&self, file: &FileNode, pn: u32, page: &mut PageCache) -> VfsResult<()> {
+        for listener in self.evict_listeners.lock().iter() {
+            (listener.listener)(pn, &page);
+        }
+        if page.dirty {
+            let page_start = pn as u64 * PAGE_SIZE as u64;
+            let len = (file.len()? - page_start).min(PAGE_SIZE as u64) as usize;
+            file.write_at(&page.data()[..len], page_start)?;
+            page.dirty = false;
+        }
+        Ok(())
+    }
 }
 
 pub struct CachedFile {
@@ -468,16 +481,7 @@ impl CachedFile {
     }
 
     fn evict_cache(&self, file: &FileNode, pn: u32, page: &mut PageCache) -> VfsResult<()> {
-        for listener in self.shared.evict_listeners.lock().iter() {
-            (listener.listener)(pn, &page);
-        }
-        if page.dirty {
-            let page_start = pn as u64 * PAGE_SIZE as u64;
-            let len = (file.len()? - page_start).min(PAGE_SIZE as u64) as usize;
-            file.write_at(&page.data()[..len], page_start)?;
-            page.dirty = false;
-        }
-        Ok(())
+        self.shared.evict_cache(file, pn, page)
     }
 
     pub fn try_prefetch(
@@ -534,11 +538,11 @@ impl CachedFile {
                 // sync read from io and write to cache, then write to dst
                 let (start_pn, size, async_pg_pn) = {
                     let mut guard = self.ra_state.lock();
-                    guard.cache_miss_update_window(pn, req_size);
+                    guard.update_window_on_cache_miss(pn, req_size);
                     (guard.start_pn, guard.size, guard.get_trigger_offset())
                 };
 
-                readahead::sync_prefetch(
+                readahead::io_submit(
                     &self.shared,
                     file,
                     self.in_memory,
