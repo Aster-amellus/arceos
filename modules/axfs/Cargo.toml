@@ -16,6 +16,7 @@ times = []
 std = ["lwext4_rust?/std"]
 
 [dependencies]
+axtask = { workspace = true }
 axalloc = { workspace = true }
 axdriver = { workspace = true, features = ["block"] }
 axerrno = { workspace = true }
