@@ -526,9 +526,11 @@ impl CachedFile {
                 let shared = self.shared.clone();
                 let file = file.inner().clone();
                 let in_memory = self.in_memory;
-                axtask::spawn(move || {
-                    readahead::async_prefetch(shared, file, in_memory, start_pn, size, async_pn);
-                });
+                // TODO: currently async prefetch's performance is terrible, maybe IO device implementation holds a lock?
+                // Or async io_submit window is misculculated causing too many small io_submit calls?
+                // axtask::spawn(move || {
+                //     readahead::async_prefetch(shared, file, in_memory, start_pn, size, async_pn);
+                // });
                 page_offset = 0;
                 continue;
             }
