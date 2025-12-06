@@ -494,7 +494,7 @@ impl CachedFile {
         let start_page = (range.start / PAGE_SIZE as u64) as u32;
         let end_page = range.end.div_ceil(PAGE_SIZE as u64) as u32;
         let req_size = end_page - start_page;
-        let page_offset = (range.start % PAGE_SIZE as u64) as usize;
+        let mut page_offset = (range.start % PAGE_SIZE as u64) as usize;
 
         for pn in start_page..end_page {
             let page_start = pn as u64 * PAGE_SIZE as u64;
@@ -526,9 +526,12 @@ impl CachedFile {
                 let shared = self.shared.clone();
                 let file = file.inner().clone();
                 let in_memory = self.in_memory;
-                axtask::spawn(move || {
-                    readahead::async_prefetch(shared, file, in_memory, start_pn, size, async_pn);
-                });
+                // TODO: currently async prefetch's performance is terrible, maybe IO device implementation holds a lock?
+                // Or async io_submit window is misculculated causing too many small io_submit calls?
+                // axtask::spawn(move || {
+                //     readahead::async_prefetch(shared, file, in_memory, start_pn, size, async_pn);
+                // });
+                page_offset = 0;
                 continue;
             }
 
@@ -558,11 +561,13 @@ impl CachedFile {
                     page_offset..(range.end - page_start).min(PAGE_SIZE as u64) as usize,
                 )?;
             }
+            page_offset = 0;
         }
         self.ra_state.lock().update_history(end_page - 1);
         Ok(read_len)
     }
 
+    // TODO: keep the lock for too long
     fn page_or_insert<'a>(
         &self,
         file: &FileNode,
