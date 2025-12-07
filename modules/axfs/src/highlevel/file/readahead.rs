@@ -39,30 +39,27 @@ impl ReadaheadState {
         }
     }
 
-    /// update readahead window on cache miss,
-    /// and return sync readahead range and pg_readahead offset.
+    /// Updates readahead window upon a cache miss, and if it should trigger sync
+    /// readahead, returns the sync readahead parameters.
+
     /// # Returns
-    /// - `Some((start_pn, size, pg_readahead_offset))` if readahead is triggered, and
-    /// sync readahead will be submitted.
-    /// - `None` for random access, readahead window reset, and no readahead triggered,
-    /// just submit the requested page to io.
+    /// - `Some((start_pn, size, pg_readahead_offset))` if readahead should be
+    /// triggered, and sync readahead should be submitted.
+    /// - `None` if random access is detected, and no readahead should be triggered,
+    /// *but* the user requested page should still be submitted for IO.
     pub fn update_window_on_cache_miss(
         &mut self,
         trigger_pn: u32,
         req_size: u32,
     ) -> Option<(u32, u32, u32)> {
-        // sequential access, although didn't hit PG_readahead
-        // or initial access,
-        // or large read request, that is worth readahead
-        if trigger_pn == self.prev_pn + 1
-            || trigger_pn == self.prev_pn
+        // sequential access, even though the PG_readahead flag was missed
+        if trigger_pn == self.prev_pn + 1 || trigger_pn == self.prev_pn
+            // first access
             || trigger_pn == 0
+            // large request
             || req_size > self.max_pages
         {
             let mut new_size = Self::init_ra_size(req_size, self.max_pages);
-            if self.size > 0 {
-                new_size = new_size.saturating_mul(RAMP_UP_SCALE).min(self.max_pages);
-            }
             self.start_pn = trigger_pn;
             self.async_size = self.size;
             self.size = new_size;
@@ -92,7 +89,7 @@ impl ReadaheadState {
     }
 
     /// get PG_readahead offset for async prefetch
-    /// Formula: start + size - async_size
+    /// 公式: start + size - async_size
     pub const fn get_trigger_offset(&self) -> u32 {
         if self.size == 0 {
             return u32::MAX;
