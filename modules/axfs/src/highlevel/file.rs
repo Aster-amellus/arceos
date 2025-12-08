@@ -583,6 +583,8 @@ impl CachedFile {
                         pg_readahead_offset,
                     );
                 });
+                // yield to let async prefetch run earlier
+                axtask::yield_now();
             }
             page_offset = 0;
         }
