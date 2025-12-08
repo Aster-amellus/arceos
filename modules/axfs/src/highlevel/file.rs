@@ -500,29 +500,66 @@ impl CachedFile {
             let page_start = pn as u64 * PAGE_SIZE as u64;
 
             use readahead::Readahead;
-            let mut async_pg_pn = None;
-            let mut should_sync_readahead = false;
+            let mut async_prefetch_info = None;
+            let mut cache_miss = false;
             {
                 let mut guard = self.shared.page_cache.lock();
-                if let Some((page, async_pn_flag)) = self.find_page_from_cache(&mut guard, pn) {
+                if let Some((page, async_prefetch)) = self.find_page_from_cache(&mut guard, pn) {
                     // write to dst immediately
                     read_len = write_buffer_callback(
                         read_len,
                         page,
                         page_offset..(range.end - page_start).min(PAGE_SIZE as u64) as usize,
                     )?;
-                    async_pg_pn = async_pn_flag;
+                    if async_prefetch.is_none() {
+                        // cache hit and no async prefetch is needed, just continue
+                        // error!("cache hit at pn={}", pn);
+                        page_offset = 0;
+                        continue;
+                    } else {
+                        async_prefetch_info = async_prefetch;
+                    }
                 } else {
-                    should_sync_readahead = true;
+                    cache_miss = true;
                 }
             }
-            // trigger async readahead
-            if async_pg_pn.is_some() {
-                let async_pn = async_pg_pn.unwrap();
-                let (start_pn, size) = {
-                    let guard = self.ra_state.lock();
-                    (guard.start_pn, guard.size)
+
+            if cache_miss {
+                if let Some((start_pn, size, pg_readahead)) = self
+                    .ra_state
+                    .lock()
+                    .update_window_on_cache_miss(pn, req_size)
+                {
+                    // readahead should be triggered
+                    // warn!(
+                    //     "cache miss, sync prefetch pn={} size={} pg_flag={}",
+                    //     start_pn, size, pg_readahead
+                    // );
+                    readahead::io_submit(
+                        &self.shared,
+                        file,
+                        self.in_memory,
+                        start_pn,
+                        size,
+                        pg_readahead,
+                    )?;
+                } else {
+                    // TODO: holding lock relatively shorter
+                    // warn!("random access detacted at pn={}", pn);
+                    readahead::io_submit(&self.shared, file, self.in_memory, pn, 1, u32::MAX)?;
                 };
+
+                let mut guard = self.shared.page_cache.lock();
+                let page = guard.get_mut(&pn).unwrap();
+
+                read_len = write_buffer_callback(
+                    read_len,
+                    page,
+                    page_offset..(range.end - page_start).min(PAGE_SIZE as u64) as usize,
+                )?;
+            } else {
+                // trigger async readahead
+                let (start_pn, size, pg_readahead_offset) = async_prefetch_info.unwrap();
                 let shared = self.shared.clone();
                 let file = file.inner().clone();
                 let in_memory = self.in_memory;
@@ -532,37 +569,20 @@ impl CachedFile {
                 // io_submit window is misculculated causing too many small
                 // io_submit calls?
 
-                // axtask::spawn(move || { readahead::async_prefetch(shared, file,
-                // in_memory, start_pn, size, async_pn); });
-                page_offset = 0;
-                continue;
-            }
-
-            if should_sync_readahead {
-                if let Some((start_pn, size, pg_readahead)) = self
-                    .ra_state
-                    .lock()
-                    .update_window_on_cache_miss(pn, req_size)
-                {
-                    // readahead should be triggered
-                    readahead::io_submit(
-                        &self.shared,
+                axtask::spawn(move || {
+                    // error!(
+                    //     "async prefetch launched, pn={} size={} pg_flag={}",
+                    //     start_pn, size, pg_readahead_offset
+                    // );
+                    readahead::async_prefetch(
+                        shared,
                         file,
-                        self.in_memory,
+                        in_memory,
                         start_pn,
                         size,
-                        pg_readahead,
-                    )?;
-                };
-
-                let mut guard = self.shared.page_cache.lock();
-                let page = self.page_or_insert(file, &mut guard, pn)?.0;
-
-                read_len = write_buffer_callback(
-                    read_len,
-                    page,
-                    page_offset..(range.end - page_start).min(PAGE_SIZE as u64) as usize,
-                )?;
+                        pg_readahead_offset,
+                    );
+                });
             }
             page_offset = 0;
         }
