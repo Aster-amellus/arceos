@@ -574,7 +574,7 @@ impl CachedFile {
                     //     "async prefetch launched, pn={} size={} pg_flag={}",
                     //     start_pn, size, pg_readahead_offset
                     // );
-                    readahead::async_prefetch(
+                    let _ = readahead::async_prefetch(
                         shared,
                         file,
                         in_memory,
