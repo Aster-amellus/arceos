@@ -39,60 +39,62 @@ impl ReadaheadState {
         }
     }
 
-    /// update readahead window on cache miss,
-    /// and return sync readahead range and pg_readahead offset.
+    /// Updates readahead window upon a cache miss, and if it should trigger sync
+    /// readahead, returns the sync readahead parameters.
+
     /// # Returns
-    /// - `Some((start_pn, size, pg_readahead_offset))` if readahead is triggered, and
-    /// sync readahead will be submitted.
-    /// - `None` for random access, readahead window reset, and no readahead triggered,
-    /// just submit the requested page to io.
+    /// - `Some((start_pn, size, pg_readahead_offset))` if readahead should be
+    /// triggered, and sync readahead should be submitted.
+    /// - `None` if random access is detected, and no readahead should be triggered,
+    /// *but* the user requested page should still be submitted for IO.
     pub fn update_window_on_cache_miss(
         &mut self,
         trigger_pn: u32,
         req_size: u32,
     ) -> Option<(u32, u32, u32)> {
-        // sequential access, although didn't hit PG_readahead
-        // or initial access,
-        // or large read request, that is worth readahead
-        if trigger_pn == self.prev_pn + 1
-            || trigger_pn == self.prev_pn
+        self.start_pn = trigger_pn;
+
+        // request size exceeds max page limit
+        if req_size > self.max_pages {
+            self.size = self.max_pages;
+            self.async_size = self.max_pages - 1; // set the next page as PG_readahead to launch async readahead immediately
+            Some((trigger_pn, self.max_pages, self.get_trigger_offset()))
+        } else if trigger_pn == self.prev_pn + 1 || trigger_pn == self.prev_pn
+        // sequential access, even though the PG_readahead flag was missed
             || trigger_pn == 0
-            || req_size > self.max_pages
+        // first access
         {
             let mut new_size = Self::init_ra_size(req_size, self.max_pages);
             if self.size > 0 {
                 new_size = new_size.saturating_mul(RAMP_UP_SCALE).min(self.max_pages);
             }
-            self.start_pn = trigger_pn;
-            self.async_size = self.size;
             self.size = new_size;
-            return Some((trigger_pn, new_size, self.get_trigger_offset()));
+            self.async_size = new_size - req_size;
+            Some((trigger_pn, new_size, self.get_trigger_offset()))
+        } else {
+            // random access, reset readahead window
+            self.size = 0;
+            self.async_size = 0;
+            None
         }
-
-        // random access, reset readahead window
-        self.size = 0;
-        self.async_size = 0;
-        None
     }
 
     /// hit PG_readahead, prepare window for upcoming async prefetch,
     /// async prefetch will be triggered at once after this function call.
     pub fn update_window_for_async(&mut self) {
-        // 1. 推进窗口起点: 新起点 = 旧起点 + 旧大小
+        // TODO: debug assert, remove in production
         assert!(self.size > 0, "Readahead window size should never be 0");
+        //  new window starts from previous one's next page
         self.start_pn = self.start_pn.saturating_add(self.size);
-        // 2. 指数倍增: size = prev_size * 2
         let mut new_size = self.size.saturating_mul(RAMP_UP_SCALE);
-        // 3. 限制上限
         new_size = new_size.min(self.max_pages);
-        // 4. 更新大小
         self.size = new_size;
-        // 5. 保持流水线: async_size = size
+        // keep full pipline
         self.async_size = new_size;
     }
 
     /// get PG_readahead offset for async prefetch
-    /// Formula: start + size - async_size
+    /// 公式: start + size - async_size
     pub const fn get_trigger_offset(&self) -> u32 {
         if self.size == 0 {
             return u32::MAX;
@@ -118,29 +120,33 @@ impl ReadaheadState {
 }
 
 pub(super) trait Readahead {
-    /// find cache from cache
+    /// find page from cache
+    /// # Returns
+    /// - `Some` if cache hit, along with [PageCache] mut reference and `Some((start_pn, size, pg_readahead_offset))` if PG_readahead flag is found
+    /// - `None` if cache miss
     fn find_page_from_cache<'a>(
         &self,
         caches: &'a mut LruCache<u32, PageCache>,
         pn: u32,
-    ) -> Option<(&'a mut PageCache, Option<u32>)>;
+    ) -> Option<(&'a mut PageCache, Option<(u32, u32, u32)>)>;
 }
 
-// TODO: terrible performance when request size is small
 impl Readahead for CachedFile {
     fn find_page_from_cache<'a>(
         &self,
         caches: &'a mut LruCache<u32, PageCache>,
         pn: u32,
-    ) -> Option<(&'a mut PageCache, Option<u32>)> {
+    ) -> Option<(&'a mut PageCache, Option<(u32, u32, u32)>)> {
         caches.get_mut(&pn).map(|cache| {
+            // cache hit
             let mut new_pg_pn = None;
             if cache.pg_readahead {
+                // find PG_readahead flag, clear the flag and prepare for async prefetch
                 cache.pg_readahead = false;
                 let mut ra = self.ra_state.lock();
                 if ra.size > 0 {
                     ra.update_window_for_async();
-                    new_pg_pn = Some(ra.get_trigger_offset());
+                    new_pg_pn = Some((ra.start_pn, ra.size, ra.get_trigger_offset()));
                 }
             }
             (cache, new_pg_pn)
@@ -155,15 +161,41 @@ pub fn async_prefetch(
     start_pn: u32,
     size: u32,
     async_pg_pn: u32,
-) {
-    let _ = io_submit(
-        &cache_shared,
-        &FileNode::new(file),
-        in_memory,
-        start_pn,
-        size,
-        async_pg_pn,
-    );
+) -> VfsResult<()> {
+    let file = FileNode::new(file);
+    for pn in start_pn..(start_pn + size) {
+        let mut caches = cache_shared.page_cache.lock();
+        if caches.contains(&pn) {
+            continue;
+        }
+        drop(caches);
+
+        // lock-free IO submission
+        let mut page = PageCache::new()?;
+        if pn == async_pg_pn {
+            page.pg_readahead = true;
+        }
+        if in_memory {
+            page.data().fill(0);
+        } else {
+            file.read_at(page.data(), pn as u64 * PAGE_SIZE as u64)?;
+        }
+
+        // load into cache
+        caches = cache_shared.page_cache.lock();
+        if caches.contains(&pn) {
+            continue;
+        }
+        if caches.len() == caches.cap().get() {
+            if let Some((evict_pn, mut evicted_page)) = caches.pop_lru() {
+                drop(caches);
+                let _ = cache_shared.evict_cache(&file, evict_pn, &mut evicted_page);
+                caches = cache_shared.page_cache.lock();
+            }
+        }
+        caches.put(pn, page);
+    }
+    Ok(())
 }
 
 pub fn io_submit(
