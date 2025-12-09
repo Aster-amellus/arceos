@@ -161,15 +161,41 @@ pub fn async_prefetch(
     start_pn: u32,
     size: u32,
     async_pg_pn: u32,
-) {
-    let _ = io_submit(
-        &cache_shared,
-        &FileNode::new(file),
-        in_memory,
-        start_pn,
-        size,
-        async_pg_pn,
-    );
+) -> VfsResult<()> {
+    let file = FileNode::new(file);
+    for pn in start_pn..(start_pn + size) {
+        let mut caches = cache_shared.page_cache.lock();
+        if caches.contains(&pn) {
+            continue;
+        }
+        drop(caches);
+
+        // lock-free IO submission
+        let mut page = PageCache::new()?;
+        if pn == async_pg_pn {
+            page.pg_readahead = true;
+        }
+        if in_memory {
+            page.data().fill(0);
+        } else {
+            file.read_at(page.data(), pn as u64 * PAGE_SIZE as u64)?;
+        }
+
+        // load into cache
+        caches = cache_shared.page_cache.lock();
+        if caches.contains(&pn) {
+            continue;
+        }
+        if caches.len() == caches.cap().get() {
+            if let Some((evict_pn, mut evicted_page)) = caches.pop_lru() {
+                drop(caches);
+                let _ = cache_shared.evict_cache(&file, evict_pn, &mut evicted_page);
+                caches = cache_shared.page_cache.lock();
+            }
+        }
+        caches.put(pn, page);
+    }
+    Ok(())
 }
 
 pub fn io_submit(
