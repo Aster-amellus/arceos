@@ -513,7 +513,7 @@ impl CachedFile {
                     )?;
                     if async_prefetch.is_none() {
                         // cache hit and no async prefetch is needed, just continue
-                        // error!("cache hit at pn={}", pn);
+                        //error!("cache hit at pn={}", pn);
                         page_offset = 0;
                         continue;
                     } else {

@@ -1,4 +1,4 @@
-use alloc::{sync::Arc, vec::Vec, vec};
+use alloc::{sync::Arc, vec, vec::Vec};
 
 use axfs_ng_vfs::{FileNode, FileNodeOps, VfsResult};
 use lru::LruCache;
@@ -66,9 +66,10 @@ impl ReadaheadState {
         // first access
         {
             let mut new_size = Self::init_ra_size(req_size, self.max_pages);
-            if self.size > 0 {
-                new_size = new_size.saturating_mul(RAMP_UP_SCALE).min(self.max_pages);
-            }
+            // NOTE: ramp up aggressively may cause lower speed, but why?
+            // if self.size > 0 {
+            //     new_size = new_size.saturating_mul(RAMP_UP_SCALE).min(self.max_pages);
+            // }
             self.size = new_size;
             self.async_size = new_size - req_size;
             Some((trigger_pn, new_size, self.get_trigger_offset()))
@@ -226,7 +227,7 @@ pub fn io_submit(
     if in_memory {
         let mut caches = cache_shared.page_cache.lock();
         if caches.len() + pages_to_read.len() > caches.cap().get() {
-             if let Some((evict_pn, mut evicted_page)) = caches.pop_lru() {
+            if let Some((evict_pn, mut evicted_page)) = caches.pop_lru() {
                 drop(caches);
                 let _ = cache_shared.evict_cache(file, evict_pn, &mut evicted_page);
                 caches = cache_shared.page_cache.lock();
@@ -234,7 +235,9 @@ pub fn io_submit(
         }
 
         for &pn in &pages_to_read {
-            if caches.contains(&pn) { continue; }
+            if caches.contains(&pn) {
+                continue;
+            }
             let mut page = PageCache::new()?;
             if pn == async_pg_pn {
                 page.pg_readahead = true;
@@ -245,13 +248,12 @@ pub fn io_submit(
         return Ok(());
     }
 
-    
     let first_pn = pages_to_read[0];
     let last_pn = *pages_to_read.last().unwrap();
     let span_pages = (last_pn - first_pn + 1) as usize;
-    
+
     let mut middle_buffer = vec![0u8; span_pages * PAGE_SIZE];
-    
+
     file.read_at(&mut middle_buffer, first_pn as u64 * PAGE_SIZE as u64)?;
 
     let mut caches = cache_shared.page_cache.lock();
@@ -276,7 +278,7 @@ pub fn io_submit(
         }
 
         let offset = (pn - first_pn) as usize * PAGE_SIZE;
-        
+
         page.data()
             .copy_from_slice(&middle_buffer[offset..offset + PAGE_SIZE]);
 
