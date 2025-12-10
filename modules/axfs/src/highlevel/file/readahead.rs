@@ -1,4 +1,4 @@
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec, vec::Vec};
 
 use axfs_ng_vfs::{FileNode, FileNodeOps, VfsResult};
 use lru::LruCache;
@@ -54,6 +54,7 @@ impl ReadaheadState {
     ) -> Option<(u32, u32, u32)> {
         self.start_pn = trigger_pn;
 
+        // TODO: add thrashing detection here
         // request size exceeds max page limit
         if req_size > self.max_pages {
             self.size = self.max_pages;
@@ -65,9 +66,10 @@ impl ReadaheadState {
         // first access
         {
             let mut new_size = Self::init_ra_size(req_size, self.max_pages);
-            if self.size > 0 {
-                new_size = new_size.saturating_mul(RAMP_UP_SCALE).min(self.max_pages);
-            }
+            // NOTE: ramp up aggressively may cause lower speed, but why?
+            // if self.size > 0 {
+            //     new_size = new_size.saturating_mul(RAMP_UP_SCALE).min(self.max_pages);
+            // }
             self.size = new_size;
             self.async_size = new_size - req_size;
             Some((trigger_pn, new_size, self.get_trigger_offset()))
@@ -163,39 +165,40 @@ pub fn async_prefetch(
     async_pg_pn: u32,
 ) -> VfsResult<()> {
     let file = FileNode::new(file);
-    for pn in start_pn..(start_pn + size) {
-        let mut caches = cache_shared.page_cache.lock();
-        if caches.contains(&pn) {
-            continue;
-        }
-        drop(caches);
+    io_submit(&cache_shared, &file, in_memory, start_pn, size, async_pg_pn)
+    // for pn in start_pn..(start_pn + size) {
+    //     let mut caches = cache_shared.page_cache.lock();
+    //     if caches.contains(&pn) {
+    //         continue;
+    //     }
+    //     drop(caches);
 
-        // lock-free IO submission
-        let mut page = PageCache::new()?;
-        if pn == async_pg_pn {
-            page.pg_readahead = true;
-        }
-        if in_memory {
-            page.data().fill(0);
-        } else {
-            file.read_at(page.data(), pn as u64 * PAGE_SIZE as u64)?;
-        }
+    //     // lock-free IO submission
+    //     let mut page = PageCache::new()?;
+    //     if pn == async_pg_pn {
+    //         page.pg_readahead = true;
+    //     }
+    //     if in_memory {
+    //         page.data().fill(0);
+    //     } else {
+    //         file.read_at(page.data(), pn as u64 * PAGE_SIZE as u64)?;
+    //     }
 
-        // load into cache
-        caches = cache_shared.page_cache.lock();
-        if caches.contains(&pn) {
-            continue;
-        }
-        if caches.len() == caches.cap().get() {
-            if let Some((evict_pn, mut evicted_page)) = caches.pop_lru() {
-                drop(caches);
-                let _ = cache_shared.evict_cache(&file, evict_pn, &mut evicted_page);
-                caches = cache_shared.page_cache.lock();
-            }
-        }
-        caches.put(pn, page);
-    }
-    Ok(())
+    //     // load into cache
+    //     caches = cache_shared.page_cache.lock();
+    //     if caches.contains(&pn) {
+    //         continue;
+    //     }
+    //     if caches.len() == caches.cap().get() {
+    //         if let Some((evict_pn, mut evicted_page)) = caches.pop_lru() {
+    //             drop(caches);
+    //             let _ = cache_shared.evict_cache(&file, evict_pn, &mut evicted_page);
+    //             caches = cache_shared.page_cache.lock();
+    //         }
+    //     }
+    //     caches.put(pn, page);
+    // }
+    // Ok(())
 }
 
 pub fn io_submit(
@@ -217,36 +220,68 @@ pub fn io_submit(
         }
     }
 
-    // lockless load pages
-    let mut loaded_pages = Vec::with_capacity(pages_to_read.len());
-    for &pn in &pages_to_read {
-        let mut page = PageCache::new()?;
-
-        if pn == async_pg_pn {
-            page.pg_readahead = true;
-        }
-
-        if in_memory {
-            page.data().fill(0);
-        } else {
-            file.read_at(page.data(), pn as u64 * PAGE_SIZE as u64)?;
-        }
-        loaded_pages.push((pn, page));
+    if pages_to_read.is_empty() {
+        return Ok(());
     }
 
-    let mut caches = cache_shared.page_cache.lock();
-    for (pn, page) in loaded_pages {
-        if caches.contains(&pn) {
-            continue;
-        }
-
-        if caches.len() == caches.cap().get() {
+    if in_memory {
+        let mut caches = cache_shared.page_cache.lock();
+        if caches.len() + pages_to_read.len() > caches.cap().get() {
             if let Some((evict_pn, mut evicted_page)) = caches.pop_lru() {
                 drop(caches);
                 let _ = cache_shared.evict_cache(file, evict_pn, &mut evicted_page);
                 caches = cache_shared.page_cache.lock();
             }
         }
+
+        for &pn in &pages_to_read {
+            if caches.contains(&pn) {
+                continue;
+            }
+            let mut page = PageCache::new()?;
+            if pn == async_pg_pn {
+                page.pg_readahead = true;
+            }
+            page.data().fill(0);
+            caches.put(pn, page);
+        }
+        return Ok(());
+    }
+
+    let first_pn = pages_to_read[0];
+    let last_pn = *pages_to_read.last().unwrap();
+    let span_pages = (last_pn - first_pn + 1) as usize;
+
+    let mut middle_buffer = vec![0u8; span_pages * PAGE_SIZE];
+
+    file.read_at(&mut middle_buffer, first_pn as u64 * PAGE_SIZE as u64)?;
+
+    let mut caches = cache_shared.page_cache.lock();
+    while caches.len() + pages_to_read.len() > caches.cap().get() {
+        if let Some((evict_pn, mut evicted_page)) = caches.pop_lru() {
+            drop(caches);
+            let _ = cache_shared.evict_cache(file, evict_pn, &mut evicted_page);
+            caches = cache_shared.page_cache.lock();
+        } else {
+            break;
+        }
+    }
+
+    for &pn in &pages_to_read {
+        if caches.contains(&pn) {
+            continue;
+        }
+
+        let mut page = PageCache::new()?;
+        if pn == async_pg_pn {
+            page.pg_readahead = true;
+        }
+
+        let offset = (pn - first_pn) as usize * PAGE_SIZE;
+
+        page.data()
+            .copy_from_slice(&middle_buffer[offset..offset + PAGE_SIZE]);
+
         caches.put(pn, page);
     }
     Ok(())
