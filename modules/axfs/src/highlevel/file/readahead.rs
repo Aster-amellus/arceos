@@ -1,4 +1,4 @@
-use alloc::{sync::Arc, vec, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 
 use axfs_ng_vfs::{FileNode, FileNodeOps, VfsResult};
 use lru::LruCache;
@@ -65,7 +65,7 @@ impl ReadaheadState {
             || trigger_pn == 0
         // first access
         {
-            let mut new_size = Self::init_ra_size(req_size, self.max_pages);
+            let new_size = Self::init_ra_size(req_size, self.max_pages);
             // NOTE: ramp up aggressively may cause lower speed, but why?
             // if self.size > 0 {
             //     new_size = new_size.saturating_mul(RAMP_UP_SCALE).min(self.max_pages);
@@ -166,39 +166,6 @@ pub fn async_prefetch(
 ) -> VfsResult<()> {
     let file = FileNode::new(file);
     io_submit(&cache_shared, &file, in_memory, start_pn, size, async_pg_pn)
-    // for pn in start_pn..(start_pn + size) {
-    //     let mut caches = cache_shared.page_cache.lock();
-    //     if caches.contains(&pn) {
-    //         continue;
-    //     }
-    //     drop(caches);
-
-    //     // lock-free IO submission
-    //     let mut page = PageCache::new()?;
-    //     if pn == async_pg_pn {
-    //         page.pg_readahead = true;
-    //     }
-    //     if in_memory {
-    //         page.data().fill(0);
-    //     } else {
-    //         file.read_at(page.data(), pn as u64 * PAGE_SIZE as u64)?;
-    //     }
-
-    //     // load into cache
-    //     caches = cache_shared.page_cache.lock();
-    //     if caches.contains(&pn) {
-    //         continue;
-    //     }
-    //     if caches.len() == caches.cap().get() {
-    //         if let Some((evict_pn, mut evicted_page)) = caches.pop_lru() {
-    //             drop(caches);
-    //             let _ = cache_shared.evict_cache(&file, evict_pn, &mut evicted_page);
-    //             caches = cache_shared.page_cache.lock();
-    //         }
-    //     }
-    //     caches.put(pn, page);
-    // }
-    // Ok(())
 }
 
 pub fn io_submit(
@@ -211,62 +178,49 @@ pub fn io_submit(
 ) -> VfsResult<()> {
     let mut pages_to_read = Vec::with_capacity(size as usize);
     {
-        let caches = cache_shared.page_cache.lock();
+        let mut caches = cache_shared.page_cache.lock();
         for pn in start_pn..(start_pn + size) {
             if caches.contains(&pn) {
                 continue;
             }
             pages_to_read.push(pn);
         }
-    }
 
-    if pages_to_read.is_empty() {
-        return Ok(());
-    }
-
-    if in_memory {
-        let mut caches = cache_shared.page_cache.lock();
-        if caches.len() + pages_to_read.len() > caches.cap().get() {
-            if let Some((evict_pn, mut evicted_page)) = caches.pop_lru() {
-                drop(caches);
-                let _ = cache_shared.evict_cache(file, evict_pn, &mut evicted_page);
-                caches = cache_shared.page_cache.lock();
-            }
+        if pages_to_read.is_empty() {
+            // all pages are already in cache
+            return Ok(());
         }
 
-        for &pn in &pages_to_read {
-            if caches.contains(&pn) {
-                continue;
+        if in_memory {
+            for pn in pages_to_read {
+                if caches.len() == caches.cap().get() {
+                    if let Some((evict_pn, mut evicted_page)) = caches.pop_lru() {
+                        let _ = cache_shared.evict_cache(file, evict_pn, &mut evicted_page);
+                    }
+                }
+                let mut page = PageCache::new()?;
+                if pn == async_pg_pn {
+                    page.pg_readahead = true;
+                }
+                page.data().fill(0);
+                caches.put(pn, page);
             }
-            let mut page = PageCache::new()?;
-            if pn == async_pg_pn {
-                page.pg_readahead = true;
-            }
-            page.data().fill(0);
-            caches.put(pn, page);
+            return Ok(());
         }
-        return Ok(());
     }
 
+    // lock free IO read
     let first_pn = pages_to_read[0];
     let last_pn = *pages_to_read.last().unwrap();
     let span_pages = (last_pn - first_pn + 1) as usize;
-
-    let mut middle_buffer = vec![0u8; span_pages * PAGE_SIZE];
-
+    let mut middle_buffer = Vec::with_capacity(span_pages * PAGE_SIZE);
+    unsafe {
+        middle_buffer.set_len(span_pages * PAGE_SIZE);
+    }
     file.read_at(&mut middle_buffer, first_pn as u64 * PAGE_SIZE as u64)?;
 
+    // load into caches
     let mut caches = cache_shared.page_cache.lock();
-    while caches.len() + pages_to_read.len() > caches.cap().get() {
-        if let Some((evict_pn, mut evicted_page)) = caches.pop_lru() {
-            drop(caches);
-            let _ = cache_shared.evict_cache(file, evict_pn, &mut evicted_page);
-            caches = cache_shared.page_cache.lock();
-        } else {
-            break;
-        }
-    }
-
     for &pn in &pages_to_read {
         if caches.contains(&pn) {
             continue;
@@ -278,10 +232,16 @@ pub fn io_submit(
         }
 
         let offset = (pn - first_pn) as usize * PAGE_SIZE;
-
         page.data()
             .copy_from_slice(&middle_buffer[offset..offset + PAGE_SIZE]);
 
+        if caches.len() == caches.cap().get() {
+            if let Some((evict_pn, mut evicted_page)) = caches.pop_lru() {
+                drop(caches);
+                let _ = cache_shared.evict_cache(file, evict_pn, &mut evicted_page);
+                caches = cache_shared.page_cache.lock();
+            }
+        }
         caches.put(pn, page);
     }
     Ok(())
