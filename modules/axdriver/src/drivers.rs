@@ -98,6 +98,43 @@ cfg_if::cfg_if! {
 }
 
 cfg_if::cfg_if! {
+    if #[cfg(block_dev = "ahci")] {
+        pub struct AhciHalImpl;
+        impl axdriver_block::ahci::AhciHal for AhciHalImpl {
+            fn virt_to_phys(va: usize) -> usize {
+                axhal::mem::virt_to_phys(va.into()).as_usize()
+            }
+
+            fn current_ms() -> u64 {
+                axhal::time::monotonic_time_nanos() / 1_000_000
+            }
+
+            fn flush_dcache() {
+                #[cfg(target_arch = "loongarch64")]
+                unsafe {
+                    // LoongArch64: Ensure data cache operations are synchronized for AHCI DMA coherency.
+                    core::arch::asm!("dbar 0");
+                }
+            }
+        }
+
+        pub struct AhciDriver;
+        register_block_driver!(AhciDriver, axdriver_block::ahci::AhciDriver<AhciHalImpl>);
+
+        impl DriverProbe for AhciDriver {
+            fn probe_global() -> Option<AxDeviceEnum> {
+                let ahci = unsafe {
+                    axdriver_block::ahci::AhciDriver::<AhciHalImpl>::try_new(
+                        axhal::mem::phys_to_virt(axconfig::devices::AHCI_PADDR.into()).into(),
+                    )?
+                };
+                Some(AxDeviceEnum::from_block(ahci))
+            }
+        }
+    }
+}
+
+cfg_if::cfg_if! {
     if #[cfg(block_dev = "bcm2835-sdhci")]{
         pub struct BcmSdhciDriver;
         register_block_driver!(BcmSdhciDriver, axdriver_block::bcm2835sdhci::SDHCIDriver);

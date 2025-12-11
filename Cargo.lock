@@ -431,6 +431,7 @@ dependencies = [
  "bcm2835-sdhci",
  "log",
  "simple-sdmmc",
+ "simple-ahci",
 ]
 
 [[package]]
@@ -2355,6 +2356,18 @@ dependencies = [
  "log",
  "volatile 0.6.1",
 ]
+
+[[package]]
+name = "simple-ahci"
+version = "0.1.0"
+source = "git+https://github.com/Starry-OS/simple-ahci.git?rev=36d0979#36d0979fedb17c7846b78d1a63f944da31f96186"
+dependencies = [
+ "bitfield-struct",
+ "log",
+ "thiserror",
+ "volatile 0.6.1",
+]
+
 
 [[package]]
 name = "slab_allocator"
