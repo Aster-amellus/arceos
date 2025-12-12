@@ -3,10 +3,8 @@ use alloc::{sync::Arc, vec::Vec};
 use axfs_ng_vfs::{FileNode, FileNodeOps, VfsResult};
 use lru::LruCache;
 
-use super::PAGE_SIZE;
-use crate::{CachedFile, PageCache, highlevel::file::CachedFileShared};
+use super::*;
 
-// TODO: u32? or u64
 /// default max page size (128KB / 4KB = 32 pages)
 pub const RA_MAX_PAGES: u32 = 32;
 
@@ -52,28 +50,32 @@ impl ReadaheadState {
         trigger_pn: u32,
         req_size: u32,
     ) -> Option<(u32, u32, u32)> {
-        self.start_pn = trigger_pn;
-
-        // TODO: add thrashing detection here
         // request size exceeds max page limit
         if req_size > self.max_pages {
+            self.start_pn = trigger_pn;
             self.size = self.max_pages;
             self.async_size = self.max_pages - 1; // set the next page as PG_readahead to launch async readahead immediately
             Some((trigger_pn, self.max_pages, self.get_trigger_offset()))
-        } else if trigger_pn == self.prev_pn + 1 || trigger_pn == self.prev_pn
-        // sequential access, even though the PG_readahead flag was missed
+        } else if trigger_pn == self.prev_pn + 1 || trigger_pn == self.prev_pn // sequential access, even though the PG_readahead flag was missed
             || trigger_pn == 0
         // first access
         {
+            self.start_pn = trigger_pn;
             let new_size = Self::init_ra_size(req_size, self.max_pages);
-            // NOTE: ramp up aggressively may cause lower speed, but why?
+            // NOTE: why ramping up aggressively may cause lower speed?
             // if self.size > 0 {
             //     new_size = new_size.saturating_mul(RAMP_UP_SCALE).min(self.max_pages);
             // }
             self.size = new_size;
             self.async_size = new_size - req_size;
             Some((trigger_pn, new_size, self.get_trigger_offset()))
-        } else {
+        }
+        // else if trigger_pn >= self.start_pn && trigger_pn < self.start_pn + self.size {
+        //     // TODO: add thrashing detection here
+        // self.start_pn = trigger_pn;
+        // }
+        else {
+            self.start_pn = trigger_pn;
             // random access, reset readahead window
             self.size = 0;
             self.async_size = 0;
@@ -84,8 +86,6 @@ impl ReadaheadState {
     /// hit PG_readahead, prepare window for upcoming async prefetch,
     /// async prefetch will be triggered at once after this function call.
     pub fn update_window_for_async(&mut self) {
-        // TODO: debug assert, remove in production
-        assert!(self.size > 0, "Readahead window size should never be 0");
         //  new window starts from previous one's next page
         self.start_pn = self.start_pn.saturating_add(self.size);
         let mut new_size = self.size.saturating_mul(RAMP_UP_SCALE);
@@ -96,7 +96,7 @@ impl ReadaheadState {
     }
 
     /// get PG_readahead offset for async prefetch
-    /// 公式: start + size - async_size
+    /// formula: start + size - async_size
     pub const fn get_trigger_offset(&self) -> u32 {
         if self.size == 0 {
             return u32::MAX;
@@ -209,40 +209,51 @@ pub fn io_submit(
         }
     }
 
-    // lock free IO read
     let first_pn = pages_to_read[0];
     let last_pn = *pages_to_read.last().unwrap();
     let span_pages = (last_pn - first_pn + 1) as usize;
-    let mut middle_buffer = Vec::with_capacity(span_pages * PAGE_SIZE);
-    unsafe {
-        middle_buffer.set_len(span_pages * PAGE_SIZE);
-    }
-    file.read_at(&mut middle_buffer, first_pn as u64 * PAGE_SIZE as u64)?;
 
-    // load into caches
-    let mut caches = cache_shared.page_cache.lock();
-    for &pn in &pages_to_read {
-        if caches.contains(&pn) {
-            continue;
-        }
-
-        let mut page = PageCache::new()?;
-        if pn == async_pg_pn {
-            page.pg_readahead = true;
-        }
-
-        let offset = (pn - first_pn) as usize * PAGE_SIZE;
-        page.data()
-            .copy_from_slice(&middle_buffer[offset..offset + PAGE_SIZE]);
-
-        if caches.len() == caches.cap().get() {
-            if let Some((evict_pn, mut evicted_page)) = caches.pop_lru() {
-                drop(caches);
-                let _ = cache_shared.evict_cache(file, evict_pn, &mut evicted_page);
-                caches = cache_shared.page_cache.lock();
+    let io = move |bounce_buffer: &mut [u8]| -> VfsResult<()> {
+        // lock free IO read
+        file.read_at(bounce_buffer, first_pn as u64 * PAGE_SIZE as u64)?;
+        // load into caches
+        let mut caches = cache_shared.page_cache.lock();
+        for &pn in &pages_to_read {
+            if caches.contains(&pn) {
+                continue;
             }
+
+            let mut page = PageCache::new()?;
+            if pn == async_pg_pn {
+                page.pg_readahead = true;
+            }
+
+            let offset = (pn - first_pn) as usize * PAGE_SIZE;
+            page.data()
+                .copy_from_slice(&bounce_buffer[offset..offset + PAGE_SIZE]);
+
+            if caches.len() == caches.cap().get() {
+                if let Some((evict_pn, mut evicted_page)) = caches.pop_lru() {
+                    drop(caches);
+                    let _ = cache_shared.evict_cache(file, evict_pn, &mut evicted_page);
+                    caches = cache_shared.page_cache.lock();
+                }
+            }
+            caches.put(pn, page);
         }
-        caches.put(pn, page);
+        Ok(())
+    };
+
+    unsafe {
+        if let Some(mut buf) = cache_shared.bounce_buffer.try_lock() {
+            let bounce_buffer = buf
+                .as_mut_slice()
+                .get_unchecked_mut(0..span_pages * PAGE_SIZE);
+            io(bounce_buffer)
+        } else {
+            let mut bounce_buffer = Vec::with_capacity(span_pages * PAGE_SIZE);
+            bounce_buffer.set_len(span_pages * PAGE_SIZE);
+            io(bounce_buffer.as_mut_slice())
+        }
     }
-    Ok(())
 }

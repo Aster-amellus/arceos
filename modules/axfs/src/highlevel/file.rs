@@ -21,6 +21,7 @@ use spin::{Mutex, RwLock};
 mod readahead;
 use super::FsContext;
 use crate::highlevel::file::readahead::RA_MAX_PAGES;
+const LRU_SIZE: usize = 64;
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy)]
@@ -355,20 +356,36 @@ intrusive_adapter!(EvictListenerAdapter = Box<EvictListener>: EvictListener { li
 
 struct CachedFileShared {
     page_cache: Mutex<LruCache<u32, PageCache>>,
+    bounce_buffer: Mutex<Vec<u8>>,
     evict_listeners: Mutex<LinkedList<EvictListenerAdapter>>,
 }
 
 impl CachedFileShared {
-    pub fn new() -> Self {
+    pub fn new(lru_size: usize, bounce_buf_size: usize) -> Self {
         Self {
-            page_cache: Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap())),
+            page_cache: Mutex::new(LruCache::new(NonZeroUsize::new(lru_size).unwrap())),
+            bounce_buffer: {
+                let mut buffer = Vec::with_capacity(PAGE_SIZE * bounce_buf_size);
+                unsafe {
+                    buffer.set_len(PAGE_SIZE * bounce_buf_size);
+                }
+                Mutex::new(buffer)
+            },
             evict_listeners: Mutex::new(LinkedList::default()),
         }
     }
 
-    pub fn new_unbounded() -> Self {
+    pub fn new_unbounded(bounce_buf_size: usize) -> Self {
         Self {
             page_cache: Mutex::new(LruCache::unbounded()),
+            bounce_buffer: {
+                let mut buffer = Vec::with_capacity(PAGE_SIZE * bounce_buf_size);
+                unsafe {
+                    buffer.set_len(PAGE_SIZE * bounce_buf_size);
+                }
+                Mutex::new(buffer)
+            },
+
             evict_listeners: Mutex::new(LinkedList::default()),
         }
     }
@@ -432,10 +449,10 @@ impl CachedFile {
             shared
         } else {
             let (shared, user_data) = if in_memory {
-                let shared = Arc::new(CachedFileShared::new_unbounded());
+                let shared = Arc::new(CachedFileShared::new_unbounded(LRU_SIZE));
                 (shared.clone(), FileUserData::Strong(shared))
             } else {
-                let shared = Arc::new(CachedFileShared::new());
+                let shared = Arc::new(CachedFileShared::new(LRU_SIZE, RA_MAX_PAGES as usize));
                 let user_data = FileUserData::Weak(Arc::downgrade(&shared));
                 (shared, user_data)
             };
@@ -513,7 +530,7 @@ impl CachedFile {
                     )?;
                     if async_prefetch.is_none() {
                         // cache hit and no async prefetch is needed, just continue
-                        //error!("cache hit at pn={}", pn);
+                        // error!("cache hit at pn={}", pn);
                         page_offset = 0;
                         continue;
                     } else {
