@@ -3,13 +3,12 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-#[cfg(feature = "times")]
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use core::{num::NonZeroUsize, ops::Range, task::Context};
 
 use axalloc::{UsageKind, global_allocator};
 use axfs_ng_vfs::{
-    FileNode, Location, NodeFlags, NodePermission, NodeType, VfsError, VfsResult, path::Path,
+    path::Path, FileNode, Location, NodeFlags, NodePermission, NodeType, VfsError, VfsResult,
 };
 use axhal::mem::{PhysAddr, VirtAddr, virt_to_phys};
 use axio::{Buf, BufMut, SeekFrom};
@@ -19,8 +18,9 @@ use lru::LruCache;
 use spin::{Mutex, RwLock};
 
 mod readahead;
-use super::FsContext;
-use crate::highlevel::file::readahead::RA_MAX_PAGES;
+
+use super::fs::FsContext;
+use readahead::RA_MAX_PAGES;
 const LRU_SIZE: usize = 64;
 
 bitflags::bitflags! {
@@ -304,11 +304,68 @@ impl Default for OpenOptions {
 
 const PAGE_SIZE: usize = 4096;
 
-#[derive(Debug)]
+struct PendingPage {
+    state: AtomicU8,
+    wq: axtask::WaitQueue,
+}
+
+impl PendingPage {
+    const LOADING: u8 = 0;
+    const OK: u8 = 1;
+    const ERR: u8 = 2;
+
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(Self::LOADING),
+            wq: axtask::WaitQueue::new(),
+        }
+    }
+
+    #[inline]
+    fn reset(&self) {
+        self.state.store(Self::LOADING, Ordering::Release);
+    }
+
+    fn complete_ok(&self) {
+        self.state.store(Self::OK, Ordering::Release);
+        self.wq.notify_all(false);
+    }
+
+    fn complete_err(&self, err: VfsError) {
+        let _ = err;
+        self.state.store(Self::ERR, Ordering::Release);
+        self.wq.notify_all(false);
+    }
+
+    fn wait(&self) -> VfsResult<()> {
+        if self.state.load(Ordering::Acquire) == Self::LOADING {
+            self.wq
+                .wait_until(|| self.state.load(Ordering::Acquire) != Self::LOADING);
+        }
+        match self.state.load(Ordering::Acquire) {
+            Self::OK => Ok(()),
+            Self::ERR => Err(VfsError::InvalidInput),
+            _ => Err(VfsError::InvalidInput),
+        }
+    }
+}
+
 pub struct PageCache {
     addr: VirtAddr,
     dirty: bool,
     pg_readahead: bool,
+    pending: Option<Arc<PendingPage>>,
+}
+
+impl core::fmt::Debug for PageCache {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PageCache")
+            .field("addr", &self.addr)
+            .field("dirty", &self.dirty)
+            .field("pg_readahead", &self.pg_readahead)
+            .field("pending", &self.pending.is_some())
+            .finish()
+    }
 }
 
 impl PageCache {
@@ -322,7 +379,23 @@ impl PageCache {
             addr: addr.into(),
             dirty: false,
             pg_readahead: false,
+            pending: None,
         })
+    }
+
+    #[inline]
+    fn set_pending(&mut self, pending: Arc<PendingPage>) {
+        self.pending = Some(pending);
+    }
+
+    #[inline]
+    fn clear_pending(&mut self) {
+        self.pending = None;
+    }
+
+    #[inline]
+    fn pending(&self) -> Option<&Arc<PendingPage>> {
+        self.pending.as_ref()
     }
 
     pub fn paddr(&self) -> PhysAddr {
@@ -357,6 +430,10 @@ intrusive_adapter!(EvictListenerAdapter = Box<EvictListener>: EvictListener { li
 struct CachedFileShared {
     page_cache: Mutex<LruCache<u32, PageCache>>,
     bounce_buffer: Mutex<Vec<u8>>,
+    pending_pool: Mutex<Vec<Arc<PendingPage>>>,
+    inflight_new: AtomicU64,
+    inflight_hit: AtomicU64,
+    inflight_wait: AtomicU64,
     evict_listeners: Mutex<LinkedList<EvictListenerAdapter>>,
 }
 
@@ -371,6 +448,10 @@ impl CachedFileShared {
                 }
                 Mutex::new(buffer)
             },
+            pending_pool: Mutex::new(Vec::new()),
+            inflight_new: AtomicU64::new(0),
+            inflight_hit: AtomicU64::new(0),
+            inflight_wait: AtomicU64::new(0),
             evict_listeners: Mutex::new(LinkedList::default()),
         }
     }
@@ -385,8 +466,30 @@ impl CachedFileShared {
                 }
                 Mutex::new(buffer)
             },
-
+            pending_pool: Mutex::new(Vec::new()),
+            inflight_new: AtomicU64::new(0),
+            inflight_hit: AtomicU64::new(0),
+            inflight_wait: AtomicU64::new(0),
             evict_listeners: Mutex::new(LinkedList::default()),
+        }
+    }
+
+    #[inline]
+    fn alloc_pending(&self) -> Arc<PendingPage> {
+        if let Some(pending) = self.pending_pool.lock().pop() {
+            pending.reset();
+            pending
+        } else {
+            Arc::new(PendingPage::new())
+        }
+    }
+
+    #[inline]
+    fn recycle_pending(&self, pending: Arc<PendingPage>) {
+        // Only recycle when there are no external references.
+        if Arc::strong_count(&pending) == 1 {
+            pending.reset();
+            self.pending_pool.lock().push(pending);
         }
     }
 
@@ -449,7 +552,7 @@ impl CachedFile {
             shared
         } else {
             let (shared, user_data) = if in_memory {
-                let shared = Arc::new(CachedFileShared::new_unbounded(LRU_SIZE));
+                let shared = Arc::new(CachedFileShared::new_unbounded(0));
                 (shared.clone(), FileUserData::Strong(shared))
             } else {
                 let shared = Arc::new(CachedFileShared::new(LRU_SIZE, RA_MAX_PAGES as usize));
@@ -511,6 +614,7 @@ impl CachedFile {
         let start_page = (range.start / PAGE_SIZE as u64) as u32;
         let end_page = range.end.div_ceil(PAGE_SIZE as u64) as u32;
         let req_size = end_page - start_page;
+        let skip_async_prefetch = req_size > RA_MAX_PAGES;
         let mut page_offset = (range.start % PAGE_SIZE as u64) as usize;
 
         for pn in start_page..end_page {
@@ -530,12 +634,10 @@ impl CachedFile {
                     )?;
                     if async_prefetch.is_none() {
                         // cache hit and no async prefetch is needed, just continue
-                        // error!("cache hit at pn={}", pn);
                         page_offset = 0;
                         continue;
-                    } else {
-                        async_prefetch_info = async_prefetch;
                     }
+                    async_prefetch_info = async_prefetch;
                 } else {
                     cache_miss = true;
                 }
@@ -566,14 +668,29 @@ impl CachedFile {
                     readahead::io_submit(&self.shared, file, self.in_memory, pn, 1, u32::MAX)?;
                 };
 
-                let mut guard = self.shared.page_cache.lock();
-                let page = guard.get_mut(&pn).unwrap();
+                // Wait for the requested page to become available (may be filled by this task
+                // or another coalesced in-flight IO).
+                loop {
+                    let mut guard = self.shared.page_cache.lock();
+                    if let Some(page) = guard.get_mut(&pn) {
+                        if let Some(pending) = page.pending().cloned() {
+                            drop(guard);
+                            self.shared
+                                .inflight_wait
+                                .fetch_add(1, Ordering::Relaxed);
+                            pending.wait()?;
+                            continue;
+                        }
 
-                read_len = write_buffer_callback(
-                    read_len,
-                    page,
-                    page_offset..(range.end - page_start).min(PAGE_SIZE as u64) as usize,
-                )?;
+                        read_len = write_buffer_callback(
+                            read_len,
+                            page,
+                            page_offset..(range.end - page_start).min(PAGE_SIZE as u64) as usize,
+                        )?;
+                        break;
+                    }
+                    return Err(VfsError::InvalidInput);
+                }
             } else {
                 // trigger async readahead
                 let (start_pn, size, pg_readahead_offset) = async_prefetch_info.unwrap();
@@ -586,22 +703,25 @@ impl CachedFile {
                 // io_submit window is misculculated causing too many small
                 // io_submit calls?
 
-                axtask::spawn(move || {
-                    // error!(
-                    //     "async prefetch launched, pn={} size={} pg_flag={}",
-                    //     start_pn, size, pg_readahead_offset
-                    // );
-                    let _ = readahead::async_prefetch(
-                        shared,
-                        file,
-                        in_memory,
-                        start_pn,
-                        size,
-                        pg_readahead_offset,
-                    );
-                });
-                // yield to let async prefetch run earlier
-                axtask::yield_now();
+                if !skip_async_prefetch {
+                    axtask::spawn(move || {
+                        // error!(
+                        //     "async prefetch launched, pn={} size={} pg_flag={}",
+                        //     start_pn, size, pg_readahead_offset
+                        // );
+                        let _ = readahead::async_prefetch(
+                            shared,
+                            file,
+                            in_memory,
+                            start_pn,
+                            size,
+                            pg_readahead_offset,
+                        );
+                    });
+                    // On single-core / cooperative scheduling, this prevents the background
+                    // prefetch task from being starved (and leaving inflight pages pending).
+                    axtask::yield_now();
+                }
             }
             page_offset = 0;
         }
