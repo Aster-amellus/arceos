@@ -168,6 +168,11 @@ impl Readahead for CachedFile {
         pn: u32,
     ) -> Option<(&'a mut PageCache, Option<(u32, u32, u32)>)> {
         caches.get_mut(&pn).map(|cache| {
+            // If this is a pending placeholder, the caller must wait for completion
+            // before reading page data. Do not touch pg_readahead yet.
+            if cache.pending().is_some() {
+                return (cache, None);
+            }
             // cache hit
             let mut new_pg_pn = None;
             if cache.pg_readahead {
@@ -220,13 +225,28 @@ pub fn io_submit(
             }
 
             if caches.len() == caches.cap().get() {
-                if let Some((evict_pn, mut evicted_page)) = caches.pop_lru() {
-                    // Avoid evicting in-flight pages.
-                    if evicted_page.pending().is_some() {
-                        caches.put(evict_pn, evicted_page);
-                        return Ok(());
+                // Cache is full: evict a non-pending page. Pending pages must not be evicted,
+                // otherwise waiters may observe missing pages / incorrect data.
+                let mut evict_target: Option<(u32, PageCache)> = None;
+                let attempts = caches.len().max(1);
+                for _ in 0..attempts {
+                    if let Some((evict_pn, evicted_page)) = caches.pop_lru() {
+                        if evicted_page.pending().is_some() {
+                            // Push it back as MRU and try another victim.
+                            caches.put(evict_pn, evicted_page);
+                            continue;
+                        }
+                        evict_target = Some((evict_pn, evicted_page));
                     }
+                    break;
+                }
+
+                if let Some((evict_pn, mut evicted_page)) = evict_target {
                     let _ = cache_shared.evict_cache(file, evict_pn, &mut evicted_page);
+                } else {
+                    // All pages are pending (or no victim found). Can't insert more pages now.
+                    // Let callers fall back to direct IO for this pn.
+                    continue;
                 }
             }
 

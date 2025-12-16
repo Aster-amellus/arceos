@@ -48,6 +48,10 @@ multitask = [
     "axsync/multitask",
     "axruntime/multitask",
 ]
+
+# RCU (QSBR)
+rcu = ["multitask", "dep:axsync", "axsync/rcu"]
+rcu-debug = ["rcu", "axsync/rcu-debug"]
 task-ext = ["axtask/task-ext"]
 sched-fifo = ["axtask/sched-fifo"]
 sched-rr = ["axtask/sched-rr", "irq"]

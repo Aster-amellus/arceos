@@ -50,6 +50,10 @@ tls = ["axfeat/tls"]
 
 # Multi-threading and scheduler
 multitask = ["arceos_api/multitask", "axfeat/multitask"]
+
+# RCU (QSBR)
+rcu = ["axfeat/rcu"]
+rcu-debug = ["axfeat/rcu-debug"]
 task-ext = ["axfeat/task-ext"]
 sched-fifo = ["axfeat/sched-fifo"]
 sched-rr = ["axfeat/sched-rr"]

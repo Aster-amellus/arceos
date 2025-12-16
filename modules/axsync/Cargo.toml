@@ -11,11 +11,23 @@ documentation = "https://arceos-org.github.io/arceos/axsync/index.html"
 
 [features]
 multitask = ["axtask/multitask"]
+rcu = [
+	"multitask",
+	"dep:axconfig",
+	"dep:axhal",
+	"dep:ctor_bare",
+	"dep:kernel_guard",
+]
+rcu-debug = ["rcu"]
 default = []
 
 [dependencies]
 axtask.workspace = true
+axconfig = { workspace = true, optional = true }
+axhal = { workspace = true, optional = true }
+ctor_bare = { workspace = true, optional = true }
 event-listener.workspace = true
+kernel_guard = { workspace = true, optional = true }
 kspin.workspace = true
 lock_api.workspace = true
 

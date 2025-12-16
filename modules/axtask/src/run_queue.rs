@@ -527,6 +527,10 @@ impl AxRunQueue {
         next_task.set_preempt_pending(false);
         next_task.set_state(TaskState::Running);
         if prev_task.ptr_eq(&next_task) {
+            // Even without an actual context switch, reaching this scheduling point
+            // implies the CPU is not in a read-side critical section that disables
+            // preemption/IRQs.
+            crate::hooks::notify_quiescent_state();
             return;
         }
 
@@ -565,6 +569,9 @@ impl AxRunQueue {
             CurrentTask::set_current(prev_task, next_task);
 
             (*prev_ctx_ptr).switch_to(&*next_ctx_ptr);
+
+            // We resumed on the new task context: this is a quiescent state.
+            crate::hooks::notify_quiescent_state();
 
             // Current it's **next_task** running on this CPU, clear the `prev_task`'s `on_cpu` field
             // to indicate that it has finished its scheduling process and no longer running on this CPU.

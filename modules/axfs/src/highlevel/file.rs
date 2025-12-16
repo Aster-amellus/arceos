@@ -4,7 +4,7 @@ use alloc::{
     vec::Vec,
 };
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use core::{num::NonZeroUsize, ops::Range, task::Context};
+use core::{num::NonZeroUsize, ops::Range, task::Context, time::Duration};
 
 use axalloc::{UsageKind, global_allocator};
 use axfs_ng_vfs::{
@@ -337,18 +337,27 @@ impl PendingPage {
         self.wq.notify_all(false);
     }
 
-    fn wait(&self) -> VfsResult<()> {
+    /// Wait until the page is ready, but don't block forever.
+    ///
+    /// Returns `Ok(true)` if timed out.
+    fn wait_timeout(&self, dur: Duration) -> VfsResult<bool> {
         if self.state.load(Ordering::Acquire) == Self::LOADING {
-            self.wq
-                .wait_until(|| self.state.load(Ordering::Acquire) != Self::LOADING);
+            let timed_out = self.wq.wait_timeout_until(dur, || {
+                self.state.load(Ordering::Acquire) != Self::LOADING
+            });
+            if timed_out {
+                return Ok(true);
+            }
         }
         match self.state.load(Ordering::Acquire) {
-            Self::OK => Ok(()),
+            Self::OK => Ok(false),
             Self::ERR => Err(VfsError::InvalidInput),
             _ => Err(VfsError::InvalidInput),
         }
     }
 }
+
+const PENDING_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub struct PageCache {
     addr: VirtAddr,
@@ -617,16 +626,43 @@ impl CachedFile {
         let skip_async_prefetch = req_size > RA_MAX_PAGES;
         let mut page_offset = (range.start % PAGE_SIZE as u64) as usize;
 
-        for pn in start_page..end_page {
+        'outer: for pn in start_page..end_page {
             let page_start = pn as u64 * PAGE_SIZE as u64;
 
             use readahead::Readahead;
             let mut async_prefetch_info = None;
             let mut cache_miss = false;
-            {
+            // Cache lookup path: if we hit a pending placeholder, wait for
+            // the in-flight IO to complete before reading page data.
+            // Use a bounded wait to avoid hanging forever under SMP contention.
+            loop {
                 let mut guard = self.shared.page_cache.lock();
                 if let Some((page, async_prefetch)) = self.find_page_from_cache(&mut guard, pn) {
-                    // write to dst immediately
+                    if let Some(pending) = page.pending().cloned() {
+                        drop(guard);
+                        self.shared
+                            .inflight_wait
+                            .fetch_add(1, Ordering::Relaxed);
+                        if pending.wait_timeout(PENDING_WAIT_TIMEOUT)? {
+                            // Timed out: fall back to direct IO for forward progress.
+                            let mut tmp = PageCache::new()?;
+                            if self.in_memory {
+                                tmp.data().fill(0);
+                            } else {
+                                file.read_at(tmp.data(), pn as u64 * PAGE_SIZE as u64)?;
+                            }
+                            read_len = write_buffer_callback(
+                                read_len,
+                                &mut tmp,
+                                page_offset..(range.end - page_start).min(PAGE_SIZE as u64) as usize,
+                            )?;
+                            page_offset = 0;
+                            continue 'outer;
+                        }
+                        continue;
+                    }
+
+                    // Cache hit: write to dst immediately.
                     read_len = write_buffer_callback(
                         read_len,
                         page,
@@ -635,12 +671,13 @@ impl CachedFile {
                     if async_prefetch.is_none() {
                         // cache hit and no async prefetch is needed, just continue
                         page_offset = 0;
-                        continue;
+                        continue 'outer;
                     }
                     async_prefetch_info = async_prefetch;
                 } else {
                     cache_miss = true;
                 }
+                break;
             }
 
             if cache_miss {
@@ -678,7 +715,22 @@ impl CachedFile {
                             self.shared
                                 .inflight_wait
                                 .fetch_add(1, Ordering::Relaxed);
-                            pending.wait()?;
+                            if pending.wait_timeout(PENDING_WAIT_TIMEOUT)? {
+                                // Timed out: fall back to direct IO for forward progress.
+                                let mut tmp = PageCache::new()?;
+                                if self.in_memory {
+                                    tmp.data().fill(0);
+                                } else {
+                                    file.read_at(tmp.data(), pn as u64 * PAGE_SIZE as u64)?;
+                                }
+                                read_len = write_buffer_callback(
+                                    read_len,
+                                    &mut tmp,
+                                    page_offset..(range.end - page_start).min(PAGE_SIZE as u64)
+                                        as usize,
+                                )?;
+                                break;
+                            }
                             continue;
                         }
 
@@ -689,7 +741,22 @@ impl CachedFile {
                         )?;
                         break;
                     }
-                    return Err(VfsError::InvalidInput);
+
+                    // The page is still missing after io_submit (e.g. cache is full of pending
+                    // pages under SMP contention). Fall back to direct IO without caching.
+                    drop(guard);
+                    let mut tmp = PageCache::new()?;
+                    if self.in_memory {
+                        tmp.data().fill(0);
+                    } else {
+                        file.read_at(tmp.data(), pn as u64 * PAGE_SIZE as u64)?;
+                    }
+                    read_len = write_buffer_callback(
+                        read_len,
+                        &mut tmp,
+                        page_offset..(range.end - page_start).min(PAGE_SIZE as u64) as usize,
+                    )?;
+                    break;
                 }
             } else {
                 // trigger async readahead

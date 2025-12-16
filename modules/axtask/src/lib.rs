@@ -41,6 +41,7 @@ cfg_if::cfg_if! {
 
         #[macro_use]
         mod run_queue;
+        mod hooks;
         mod task;
         mod api;
         mod wait_queue;
@@ -54,6 +55,9 @@ cfg_if::cfg_if! {
         #[doc(cfg(feature = "multitask"))]
         pub use self::api::*;
         pub use self::api::{sleep, sleep_until, yield_now};
+
+        #[doc(cfg(feature = "multitask"))]
+        pub use self::hooks::register_quiescent_state_hook;
     } else {
         mod api_s;
         pub use self::api_s::{sleep, sleep_until, yield_now};

@@ -16,6 +16,9 @@
 
 pub use kspin as spin;
 
+#[cfg(feature = "rcu")]
+extern crate alloc;
+
 #[cfg(feature = "multitask")]
 mod mutex;
 
@@ -26,3 +29,7 @@ pub use self::mutex::{Mutex, MutexGuard, RawMutex};
 #[cfg(not(feature = "multitask"))]
 #[doc(cfg(not(feature = "multitask")))]
 pub use kspin::{SpinNoIrq as Mutex, SpinNoIrqGuard as MutexGuard};
+
+#[cfg(feature = "rcu")]
+#[doc(cfg(feature = "rcu"))]
+pub mod rcu;

@@ -100,7 +100,11 @@ pub fn init_scheduler_with_cpu_num(cpu_num: usize) {
     info!("  use {} scheduler.", Scheduler::scheduler_name());
 }
 
-pub(crate) fn active_cpu_num() -> usize {
+/// Returns the number of CPUs that have been initialized for scheduling.
+///
+/// Note: this is a runtime value (online/active CPUs), and may be less than
+/// `axconfig::plat::CPU_NUM` during early boot or partial CPU bring-up.
+pub fn active_cpu_num() -> usize {
     CPU_NUM.load(core::sync::atomic::Ordering::Relaxed)
 }
 
@@ -120,6 +124,11 @@ pub fn on_timer_tick() {
     // Since irq and preemption are both disabled here,
     // we can get current run queue with the default `kernel_guard::NoOp`.
     current_run_queue::<NoOp>().scheduler_timer_tick();
+
+    // Timer tick is also a quiescent state from QSBR perspective: RCU read-side
+    // disables IRQs, so if we are handling a tick, we are not inside such a
+    // critical section.
+    crate::hooks::notify_quiescent_state();
 }
 
 /// Adds the given task to the run queue, returns the task reference.
