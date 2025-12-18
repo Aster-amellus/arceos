@@ -5,6 +5,18 @@ use lru::LruCache;
 
 use super::*;
 
+#[cfg(feature = "pending-debug")]
+macro_rules! pending_log {
+    ($($arg:tt)*) => {
+        log::info!($($arg)*)
+    };
+}
+
+#[cfg(not(feature = "pending-debug"))]
+macro_rules! pending_log {
+    ($($arg:tt)*) => {};
+}
+
 /// default max page size (128KB / 4KB = 32 pages)
 pub const RA_MAX_PAGES: u32 = 32;
 
@@ -70,6 +82,12 @@ impl ReadaheadState {
         trigger_pn: u32,
         req_size: u32,
     ) -> Option<(u32, u32, u32)> {
+        if cfg!(feature = "no-readahead") {
+            self.start_pn = trigger_pn;
+            self.size = 0;
+            self.async_size = 0;
+            return None;
+        }
         // request size exceeds max page limit
         if req_size > self.max_pages {
             self.start_pn = trigger_pn;
@@ -171,6 +189,12 @@ impl Readahead for CachedFile {
             // If this is a pending placeholder, the caller must wait for completion
             // before reading page data. Do not touch pg_readahead yet.
             if cache.pending().is_some() {
+                pending_log!("axfs: SYNC-READ pn={} find_page_from_cache hit pending", pn);
+                return (cache, None);
+            }
+
+            if cfg!(feature = "no-readahead") {
+                pending_log!("axfs: SYNC-READ pn={} find_page_from_cache hit", pn);
                 return (cache, None);
             }
             // cache hit
@@ -184,6 +208,11 @@ impl Readahead for CachedFile {
                     new_pg_pn = Some((ra.start_pn, ra.size, ra.get_trigger_offset()));
                 }
             }
+            pending_log!(
+                "axfs: SYNC-READ pn={} find_page_from_cache hit{}",
+                pn,
+                if new_pg_pn.is_some() { " (PG_readahead)" } else { "" }
+            );
             (cache, new_pg_pn)
         })
     }
@@ -198,17 +227,28 @@ pub fn async_prefetch(
     async_pg_pn: u32,
 ) -> VfsResult<()> {
     let file = FileNode::new(file);
-    io_submit(&cache_shared, &file, in_memory, start_pn, size, async_pg_pn)
+    io_submit(&cache_shared, &file, in_memory, true, start_pn, size, async_pg_pn)
 }
 
 pub fn io_submit(
     cache_shared: &CachedFileShared,
     file: &FileNode,
     in_memory: bool,
+    is_async: bool,
     start_pn: u32,
     size: u32,
     async_pg_pn: u32,
 ) -> VfsResult<()> {
+    #[allow(unused_variables)]
+    let kind = if is_async { "ASYNC" } else { "SYNC" };
+    pending_log!(
+        "axfs: io_submit({}) start_pn={} size={} in_memory={} async_pg_pn={}",
+        kind,
+        start_pn,
+        size,
+        in_memory,
+        async_pg_pn
+    );
     // 1) Insert pending placeholders into the page cache.
     // Only pages inserted into `owned` will be filled by this call.
     let mut owned: Vec<(u32, Arc<PendingPage>)> = Vec::new();
@@ -220,6 +260,7 @@ pub fn io_submit(
                     cache_shared
                         .inflight_hit
                         .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    pending_log!("axfs: io_submit({}) pn={} coalesced(hit pending)", kind, pn);
                 }
                 continue;
             }
@@ -243,9 +284,15 @@ pub fn io_submit(
 
                 if let Some((evict_pn, mut evicted_page)) = evict_target {
                     let _ = cache_shared.evict_cache(file, evict_pn, &mut evicted_page);
+                    pending_log!("axfs: io_submit({}) evict pn={}", kind, evict_pn);
                 } else {
                     // All pages are pending (or no victim found). Can't insert more pages now.
                     // Let callers fall back to direct IO for this pn.
+                    pending_log!(
+                        "axfs: io_submit({}) pn={} skip insert (all pending)",
+                        kind,
+                        pn
+                    );
                     continue;
                 }
             }
@@ -258,11 +305,39 @@ pub fn io_submit(
                 .inflight_new
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             owned.push((pn, pending));
+            pending_log!("axfs: io_submit({}) pn={} inserted pending", kind, pn);
         }
     }
 
     if owned.is_empty() {
+        pending_log!("axfs: io_submit({}) nothing to do", kind);
         return Ok(());
+    }
+
+    // Debug hook: widen the time window where pending placeholders exist in the cache.
+    //
+    // On SMP=1 with cooperative scheduling, an async prefetch task may otherwise run from
+    // "insert pending" all the way to "clear_pending" without giving other tasks a chance
+    // to observe the pending state. Yielding here makes it much easier to reproduce
+    // `axfs: SYNC-READ pn=... cache-hit pending -> wait` deterministically.
+    #[cfg(feature = "pending-debug")]
+    {
+        // Keep this tiny and debug-only to avoid affecting normal performance.
+        const DEBUG_PENDING_YIELD_ITERS: usize = 128;
+        const DEBUG_PENDING_HOLD_ASYNC_ONLY: bool = true;
+
+        if !DEBUG_PENDING_HOLD_ASYNC_ONLY || is_async {
+            pending_log!(
+                "axfs: io_submit({}) debug-hold pending (yield {} iters) start_pn={} size={}",
+                kind,
+                DEBUG_PENDING_YIELD_ITERS,
+                start_pn,
+                size
+            );
+            for _ in 0..DEBUG_PENDING_YIELD_ITERS {
+                axtask::yield_now();
+            }
+        }
     }
 
     // In-memory file: populate cache with zeros, no device IO.
@@ -273,11 +348,13 @@ pub fn io_submit(
                 if pn == async_pg_pn {
                     page.pg_readahead = true;
                 }
+                pending_log!("axfs: io_submit({}) pn={} filling zero (in_memory file)", kind, pn);
                 page.data().fill(0);
                 page.clear_pending();
             }
             pending.complete_ok();
             cache_shared.recycle_pending(pending);
+            pending_log!("axfs: io_submit({}) pn={} complete_ok (in_memory)", kind, pn);
         }
         return Ok(());
     }
@@ -285,6 +362,13 @@ pub fn io_submit(
     let first_pn = owned.first().unwrap().0;
     let last_pn = owned.last().unwrap().0;
     let span_pages = (last_pn - first_pn + 1) as usize;
+    pending_log!(
+        "axfs: io_submit({}) span first_pn={} last_pn={} span_pages={}",
+        kind,
+        first_pn,
+        last_pn,
+        span_pages
+    );
 
     // 2) IO worker: does lock-free device read and then fills the page cache.
     let io_worker = |bounce_buffer: &mut [u8]| -> VfsResult<()> {
@@ -342,6 +426,7 @@ pub fn io_submit(
                     pending.complete_ok();
                     cache_shared.recycle_pending(pending);
                 }
+                pending_log!("axfs: io_submit({}) complete_ok span_pages={}", kind, span_pages);
                 Ok(())
             }
             Err(err) => {
@@ -351,7 +436,14 @@ pub fn io_submit(
                     let _ = caches.pop(&pn);
                     pending.complete_err(VfsError::InvalidInput);
                     cache_shared.recycle_pending(pending);
+                    pending_log!("axfs: io_submit({}) pn={} complete_err+removed", kind, pn);
                 }
+                pending_log!(
+                    "axfs: io_submit({}) complete_err span_pages={} err={:?}",
+                    kind,
+                    span_pages,
+                    err
+                );
                 Err(err)
             }
         }

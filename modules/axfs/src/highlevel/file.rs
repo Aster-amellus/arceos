@@ -21,7 +21,19 @@ mod readahead;
 
 use super::fs::FsContext;
 use readahead::RA_MAX_PAGES;
-const LRU_SIZE: usize = 64;
+const LRU_SIZE: usize = 1024;
+
+#[cfg(feature = "pending-debug")]
+macro_rules! pending_log {
+    ($($arg:tt)*) => {
+        log::info!($($arg)*)
+    };
+}
+
+#[cfg(not(feature = "pending-debug"))]
+macro_rules! pending_log {
+    ($($arg:tt)*) => {};
+}
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy)]
@@ -626,6 +638,14 @@ impl CachedFile {
         let skip_async_prefetch = req_size > RA_MAX_PAGES;
         let mut page_offset = (range.start % PAGE_SIZE as u64) as usize;
 
+        pending_log!(
+            "axfs: try_prefetch range=[{}, {}) req_pages={} skip_async={}",
+            range.start,
+            range.end,
+            req_size,
+            skip_async_prefetch
+        );
+
         'outer: for pn in start_page..end_page {
             let page_start = pn as u64 * PAGE_SIZE as u64;
 
@@ -639,11 +659,16 @@ impl CachedFile {
                 let mut guard = self.shared.page_cache.lock();
                 if let Some((page, async_prefetch)) = self.find_page_from_cache(&mut guard, pn) {
                     if let Some(pending) = page.pending().cloned() {
+                        pending_log!("axfs: SYNC-READ pn={} cache-hit pending -> wait", pn);
                         drop(guard);
                         self.shared
                             .inflight_wait
                             .fetch_add(1, Ordering::Relaxed);
                         if pending.wait_timeout(PENDING_WAIT_TIMEOUT)? {
+                            pending_log!(
+                                "axfs: SYNC-READ pn={} pending wait timeout -> direct-io fallback",
+                                pn
+                            );
                             // Timed out: fall back to direct IO for forward progress.
                             let mut tmp = PageCache::new()?;
                             if self.in_memory {
@@ -663,6 +688,15 @@ impl CachedFile {
                     }
 
                     // Cache hit: write to dst immediately.
+                    pending_log!(
+                        "axfs: pn={} cache-hit{}",
+                        pn,
+                        if async_prefetch.is_some() {
+                            " (PG_readahead)"
+                        } else {
+                            ""
+                        }
+                    );
                     read_len = write_buffer_callback(
                         read_len,
                         page,
@@ -675,6 +709,7 @@ impl CachedFile {
                     }
                     async_prefetch_info = async_prefetch;
                 } else {
+                    pending_log!("axfs: pn={} cache-miss", pn);
                     cache_miss = true;
                 }
                 break;
@@ -691,10 +726,17 @@ impl CachedFile {
                     //     "cache miss, sync prefetch pn={} size={} pg_flag={}",
                     //     start_pn, size, pg_readahead
                     // );
+                    pending_log!(
+                        "axfs: sync-readahead submit start_pn={} size={} pg_pn={}",
+                        start_pn,
+                        size,
+                        pg_readahead
+                    );
                     readahead::io_submit(
                         &self.shared,
                         file,
                         self.in_memory,
+                        false,
                         start_pn,
                         size,
                         pg_readahead,
@@ -702,7 +744,16 @@ impl CachedFile {
                 } else {
                     // TODO: holding lock relatively shorter
                     // warn!("random access detacted at pn={}", pn);
-                    readahead::io_submit(&self.shared, file, self.in_memory, pn, 1, u32::MAX)?;
+                    pending_log!("axfs: sync-read submit pn={} size=1 (no-ra)", pn);
+                    readahead::io_submit(
+                        &self.shared,
+                        file,
+                        self.in_memory,
+                        false,
+                        pn,
+                        1,
+                        u32::MAX,
+                    )?;
                 };
 
                 // Wait for the requested page to become available (may be filled by this task
@@ -711,11 +762,16 @@ impl CachedFile {
                     let mut guard = self.shared.page_cache.lock();
                     if let Some(page) = guard.get_mut(&pn) {
                         if let Some(pending) = page.pending().cloned() {
+                            pending_log!("axfs: SYNC-READ pn={} miss->pending -> wait", pn);
                             drop(guard);
                             self.shared
                                 .inflight_wait
                                 .fetch_add(1, Ordering::Relaxed);
                             if pending.wait_timeout(PENDING_WAIT_TIMEOUT)? {
+                                pending_log!(
+                                    "axfs: SYNC-READ pn={} miss pending wait timeout -> direct-io fallback",
+                                    pn
+                                );
                                 // Timed out: fall back to direct IO for forward progress.
                                 let mut tmp = PageCache::new()?;
                                 if self.in_memory {
@@ -744,10 +800,15 @@ impl CachedFile {
 
                     // The page is still missing after io_submit (e.g. cache is full of pending
                     // pages under SMP contention). Fall back to direct IO without caching.
+                    pending_log!(
+                        "axfs: SYNC-READ pn={} missing after io_submit -> direct-io fallback",
+                        pn
+                    );
                     drop(guard);
                     let mut tmp = PageCache::new()?;
                     if self.in_memory {
                         tmp.data().fill(0);
+
                     } else {
                         file.read_at(tmp.data(), pn as u64 * PAGE_SIZE as u64)?;
                     }
@@ -761,6 +822,12 @@ impl CachedFile {
             } else {
                 // trigger async readahead
                 let (start_pn, size, pg_readahead_offset) = async_prefetch_info.unwrap();
+                pending_log!(
+                    "axfs: async-prefetch spawn start_pn={} size={} pg_off={}",
+                    start_pn,
+                    size,
+                    pg_readahead_offset
+                );
                 let shared = self.shared.clone();
                 let file = file.inner().clone();
                 let in_memory = self.in_memory;
@@ -788,6 +855,8 @@ impl CachedFile {
                     // On single-core / cooperative scheduling, this prevents the background
                     // prefetch task from being starved (and leaving inflight pages pending).
                     axtask::yield_now();
+                } else {
+                    pending_log!("axfs: async-prefetch skipped (large request)");
                 }
             }
             page_offset = 0;
@@ -810,10 +879,26 @@ impl CachedFile {
         }
         let mut evicted = None;
         if cache.len() == cache.cap().get() {
-            // Cache is full, remove the least recently used page
-            if let Some((pn, mut page)) = cache.pop_lru() {
-                self.evict_cache(file, pn, &mut page)?;
-                evicted = Some((pn, page));
+            // Cache is full: evict a non-pending page. Pending pages must not be evicted.
+            let mut evict_target: Option<(u32, PageCache)> = None;
+            let attempts = cache.len().max(1);
+            for _ in 0..attempts {
+                if let Some((evict_pn, evicted_page)) = cache.pop_lru() {
+                    if evicted_page.pending().is_some() {
+                        cache.put(evict_pn, evicted_page);
+                        continue;
+                    }
+                    evict_target = Some((evict_pn, evicted_page));
+                }
+                break;
+            }
+
+            if let Some((evict_pn, mut page)) = evict_target {
+                self.evict_cache(file, evict_pn, &mut page)?;
+                evicted = Some((evict_pn, page));
+            } else {
+                pending_log!("axfs: page_or_insert pn={} no victim (all pending)", pn);
+                return Err(VfsError::ResourceBusy);
             }
         }
 
@@ -855,15 +940,38 @@ impl CachedFile {
         let mut page_offset = (range.start % PAGE_SIZE as u64) as usize;
         for pn in start_page..end_page {
             let page_start = pn as u64 * PAGE_SIZE as u64;
+            let page_range = page_offset..(range.end - page_start).min(PAGE_SIZE as u64) as usize;
 
-            let mut guard = self.shared.page_cache.lock();
-            let page = self.page_or_insert(file, &mut guard, pn)?.0;
+            // Write path must not write into a pending placeholder page, otherwise
+            // async IO may later overwrite the modifications.
+            loop {
+                let mut guard = self.shared.page_cache.lock();
+                let (page, _evicted) = self.page_or_insert(file, &mut guard, pn)?;
+                if let Some(pending) = page.pending().cloned() {
+                    pending_log!("axfs: SYNC-WRITE pn={} hit pending -> wait", pn);
+                    drop(guard);
+                    self.shared
+                        .inflight_wait
+                        .fetch_add(1, Ordering::Relaxed);
+                    if pending.wait_timeout(PENDING_WAIT_TIMEOUT)? {
+                        pending_log!(
+                            "axfs: SYNC-WRITE pn={} pending wait timeout -> remove placeholder + retry",
+                            pn
+                        );
+                        let mut guard = self.shared.page_cache.lock();
+                        if let Some(existing) = guard.pop(&pn) {
+                            if existing.pending().is_none() {
+                                // Another worker completed it while we were timing out; keep it.
+                                guard.put(pn, existing);
+                            }
+                        }
+                    }
+                    continue;
+                }
 
-            initial = page_each(
-                initial,
-                page,
-                page_offset..(range.end - page_start).min(PAGE_SIZE as u64) as usize,
-            )?;
+                initial = page_each(initial, page, page_range.clone())?;
+                break;
+            }
             page_offset = 0;
         }
 

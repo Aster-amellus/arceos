@@ -68,6 +68,7 @@ fs = [
 fs-ext4 = ["fs", "axfs/ext4"]
 fs-fat = ["fs", "axfs/fat"]
 fs-times = ["fs", "axfs/times"]
+fs-no-readahead = ["fs", "axfs/no-readahead"]
 
 # Networking
 net = ["alloc", "paging", "axdriver/virtio-net", "dep:axnet", "axruntime/net"]

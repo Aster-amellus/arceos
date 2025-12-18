@@ -38,6 +38,13 @@ endif
 
 override FEATURES := $(strip $(FEATURES))
 
+# Be forgiving: users may pass already-prefixed features like `axfeat/foo` or `axstd/bar`.
+# The build system will add the appropriate prefix later, so strip these here.
+# Apply twice to handle accidental double prefixes like `axfeat/axfeat/foo`.
+override FEATURES := $(foreach f,$(FEATURES),$(patsubst axfeat/%,%,$(patsubst axstd/%,%,$(f))))
+override FEATURES := $(foreach f,$(FEATURES),$(patsubst axfeat/%,%,$(patsubst axstd/%,%,$(f))))
+override FEATURES := $(strip $(FEATURES))
+
 ax_feat :=
 lib_feat :=
 

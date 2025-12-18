@@ -14,6 +14,8 @@ fat = ["dep:fatfs"]
 ext4 = ["dep:lwext4_rust"]
 times = []
 std = ["lwext4_rust?/std"]
+pending-debug = []         # verbose logs for pending-page/inflight IO
+no-readahead = []          # disable readahead state machine (always submit exact requested pages)
 
 [dependencies]
 axtask = { workspace = true }
