@@ -21,7 +21,7 @@ mod readahead;
 
 use super::fs::FsContext;
 use readahead::RA_MAX_PAGES;
-const LRU_SIZE: usize = 1024;
+const LRU_SIZE: usize = 512;
 
 #[cfg(feature = "pending-debug")]
 macro_rules! pending_log {

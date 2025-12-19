@@ -320,25 +320,25 @@ pub fn io_submit(
     // "insert pending" all the way to "clear_pending" without giving other tasks a chance
     // to observe the pending state. Yielding here makes it much easier to reproduce
     // `axfs: SYNC-READ pn=... cache-hit pending -> wait` deterministically.
-    #[cfg(feature = "pending-debug")]
-    {
-        // Keep this tiny and debug-only to avoid affecting normal performance.
-        const DEBUG_PENDING_YIELD_ITERS: usize = 128;
-        const DEBUG_PENDING_HOLD_ASYNC_ONLY: bool = true;
+    // #[cfg(feature = "pending-debug")]
+    // {
+    //     // Keep this tiny and debug-only to avoid affecting normal performance.
+    //     const DEBUG_PENDING_YIELD_ITERS: usize = 128;
+    //     const DEBUG_PENDING_HOLD_ASYNC_ONLY: bool = true;
 
-        if !DEBUG_PENDING_HOLD_ASYNC_ONLY || is_async {
-            pending_log!(
-                "axfs: io_submit({}) debug-hold pending (yield {} iters) start_pn={} size={}",
-                kind,
-                DEBUG_PENDING_YIELD_ITERS,
-                start_pn,
-                size
-            );
-            for _ in 0..DEBUG_PENDING_YIELD_ITERS {
-                axtask::yield_now();
-            }
-        }
-    }
+    //     if !DEBUG_PENDING_HOLD_ASYNC_ONLY || is_async {
+    //         pending_log!(
+    //             "axfs: io_submit({}) debug-hold pending (yield {} iters) start_pn={} size={}",
+    //             kind,
+    //             DEBUG_PENDING_YIELD_ITERS,
+    //             start_pn,
+    //             size
+    //         );
+    //         for _ in 0..DEBUG_PENDING_YIELD_ITERS {
+    //             axtask::yield_now();
+    //         }
+    //     }
+    // }
 
     // In-memory file: populate cache with zeros, no device IO.
     if in_memory {
