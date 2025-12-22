@@ -25,9 +25,7 @@ const LRU_SIZE: usize = 512;
 
 #[cfg(feature = "pending-debug")]
 macro_rules! pending_log {
-    ($($arg:tt)*) => {
-        log::info!($($arg)*)
-    };
+    ($($arg:tt)*) => {};
 }
 
 #[cfg(not(feature = "pending-debug"))]
@@ -515,6 +513,9 @@ impl CachedFileShared {
     }
 
     pub fn evict_cache(&self, file: &FileNode, pn: u32, page: &mut PageCache) -> VfsResult<()> {
+        if page.pending().is_some() {
+            log::error!("axfs: FATAL ERROR - Evicting a PENDING page! pn={}", pn);
+        }
         for listener in self.evict_listeners.lock().iter() {
             (listener.listener)(pn, &page);
         }
@@ -885,6 +886,7 @@ impl CachedFile {
             for _ in 0..attempts {
                 if let Some((evict_pn, evicted_page)) = cache.pop_lru() {
                     if evicted_page.pending().is_some() {
+                        log::warn!("axfs: page_or_insert skipped pending page pn={}", evict_pn);
                         cache.put(evict_pn, evicted_page);
                         continue;
                     }
@@ -897,7 +899,7 @@ impl CachedFile {
                 self.evict_cache(file, evict_pn, &mut page)?;
                 evicted = Some((evict_pn, page));
             } else {
-                pending_log!("axfs: page_or_insert pn={} no victim (all pending)", pn);
+                log::info!("axfs: page_or_insert pn={} no victim (all pending)", pn);
                 return Err(VfsError::ResourceBusy);
             }
         }

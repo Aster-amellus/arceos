@@ -7,9 +7,7 @@ use super::*;
 
 #[cfg(feature = "pending-debug")]
 macro_rules! pending_log {
-    ($($arg:tt)*) => {
-        log::info!($($arg)*)
-    };
+    ($($arg:tt)*) => {};
 }
 
 #[cfg(not(feature = "pending-debug"))]
@@ -273,6 +271,7 @@ pub fn io_submit(
                 for _ in 0..attempts {
                     if let Some((evict_pn, evicted_page)) = caches.pop_lru() {
                         if evicted_page.pending().is_some() {
+                            log::warn!("axfs: eviction skipped pending page pn={}", evict_pn);
                             // Push it back as MRU and try another victim.
                             caches.put(evict_pn, evicted_page);
                             continue;
@@ -288,7 +287,7 @@ pub fn io_submit(
                 } else {
                     // All pages are pending (or no victim found). Can't insert more pages now.
                     // Let callers fall back to direct IO for this pn.
-                    pending_log!(
+                    log::info!(
                         "axfs: io_submit({}) pn={} skip insert (all pending)",
                         kind,
                         pn
@@ -327,13 +326,13 @@ pub fn io_submit(
     //     const DEBUG_PENDING_HOLD_ASYNC_ONLY: bool = true;
 
     //     if !DEBUG_PENDING_HOLD_ASYNC_ONLY || is_async {
-    //         pending_log!(
-    //             "axfs: io_submit({}) debug-hold pending (yield {} iters) start_pn={} size={}",
-    //             kind,
-    //             DEBUG_PENDING_YIELD_ITERS,
-    //             start_pn,
-    //             size
-    //         );
+    //         // log::info!(
+    //         //     "axfs: io_submit({}) debug-hold pending (yield {} iters) start_pn={} size={}",
+    //         //     kind,
+    //         //     DEBUG_PENDING_YIELD_ITERS,
+    //         //     start_pn,
+    //         //     size
+    //         // );
     //         for _ in 0..DEBUG_PENDING_YIELD_ITERS {
     //             axtask::yield_now();
     //         }
