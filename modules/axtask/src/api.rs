@@ -125,10 +125,8 @@ pub fn on_timer_tick() {
     // we can get current run queue with the default `kernel_guard::NoOp`.
     current_run_queue::<NoOp>().scheduler_timer_tick();
 
-    // Timer tick is also a quiescent state from QSBR perspective: RCU read-side
-    // disables IRQs, so if we are handling a tick, we are not inside such a
-    // critical section.
-    crate::hooks::notify_quiescent_state();
+    // Drive the EBR poll budget from periodic ticks without adding large latency.
+    crate::rcu::rcu_poll_on_tick();
 }
 
 /// Adds the given task to the run queue, returns the task reference.

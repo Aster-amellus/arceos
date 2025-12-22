@@ -18,6 +18,9 @@ pub fn register_quiescent_state_hook(hook: fn()) -> bool {
 
 #[inline(always)]
 pub(crate) fn notify_quiescent_state() {
+    // Perform RCU polling on context-switch style quiescent states.
+    crate::rcu::rcu_poll_on_context_switch();
+
     let ptr = QS_HOOK.load(Ordering::Relaxed);
     if ptr != 0 {
         // Safety: only `fn()` pointers are stored here.

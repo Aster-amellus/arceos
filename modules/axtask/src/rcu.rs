@@ -1,32 +1,25 @@
 // modules/axtask/src/rcu.rs
-#![allow(dead_code)]
 
 pub use axsync::rcu::{
-    Epoch, Guard,
-    pin, is_pinned,
-    rcu_read_lock, rcu_read_unlock,
-    rcu_assign_ptr, rcu_deref_ptr,
-    Retired, retire, retire_ptr,
-    poll, synchronize,
+    Epoch, Guard, Retired, is_pinned, pin, poll, poll_budgeted, rcu_assign_ptr,
+    rcu_deref_ptr, rcu_read_lock, rcu_read_unlock, retire, retire_ptr, synchronize,
 };
+
+const TICK_BUDGET: usize = 8;
 
 /// Called at scheduler/timer safe points to amortize EBR reclamation.
 ///
-/// Suggested call sites (pick what fits your kernel):
-/// - timer tick handler end
-/// - context switch path
-/// - runqueue operations batch end
+/// Timer ticks should remain lightweight, so use a small budget.
 pub fn rcu_poll_on_tick() -> bool {
-    poll()
+    poll_budgeted(TICK_BUDGET)
 }
 
+/// Context switch hook: run a fuller poll to advance epochs and reclaim.
 pub fn rcu_poll_on_context_switch() -> bool {
     poll()
 }
 
-/// Optional compatibility name: if the old QSBR code called something like `quiescent_state()`,
-/// you can keep the symbol but change semantics to EBR poll.
-/// (This helps incremental refactor.)
+/// Optional compatibility name mirroring legacy quiescent-state helpers.
 pub fn quiescent_state_compat() -> bool {
-    poll()
+    poll_budgeted(TICK_BUDGET)
 }
